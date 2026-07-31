@@ -1,6 +1,7 @@
 # Compiled Executables (Root only - leading slash prevents ignoring cmd/lab-runner)
 /lab-runner
 /lab-runner.exe
+/lab-runner.exe~
 /*.exe
 /*.exe~
 /*.exe.test
