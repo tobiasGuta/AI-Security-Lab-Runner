@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/output"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/output"
 )
 
 var (
@@ -28,6 +28,7 @@ type Client interface {
 	ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
 	CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error
 	ListManagedResources(ctx context.Context) ([]string, error)
+	VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error
 }
 
 type CLIClient struct {
@@ -40,7 +41,6 @@ func NewCLIClient() *CLIClient {
 	}
 }
 
-// Invariant 1: Agent commands never execute on the host. Host calls docker directly via exec.CommandContext.
 func (c *CLIClient) runDockerCmd(ctx context.Context, args ...string) (string, string, int, error) {
 	cmd := exec.CommandContext(ctx, c.dockerBin, args...)
 
@@ -71,12 +71,9 @@ func (c *CLIClient) CheckDockerAvailable(ctx context.Context) error {
 }
 
 func (c *CLIClient) CheckComposeAvailable(ctx context.Context) error {
-	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "version")
+	_, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "version")
 	if err != nil || exitCode != 0 {
 		return fmt.Errorf("%w: docker compose version failed: %s", ErrDockerUnavailable, stderr)
-	}
-	if !strings.Contains(strings.ToLower(stdout), "v2") && !strings.Contains(strings.ToLower(stdout), "version 2") && !strings.Contains(stdout, "v5") && !strings.Contains(stdout, "v3") {
-		// Accept v2+ (e.g. v2.x, v3.x, v5.x)
 	}
 	return nil
 }
@@ -103,14 +100,21 @@ func (c *CLIClient) BuildImage(ctx context.Context, dockerfilePath, imageTag str
 }
 
 func (c *CLIClient) ComposeUp(ctx context.Context, projectName, composeFilePath string) error {
-	_, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "up", "-d", "--build")
+	_, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "up", "-d")
 	if err != nil || exitCode != 0 {
 		return fmt.Errorf("%w: docker compose up failed (exit code %d): %s", ErrDockerExecFailed, exitCode, stderr)
 	}
 	return nil
 }
 
-// Invariant 11: Destructive Docker operations require verified labels.
+func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error {
+	stdout, _, exitCode, err := c.runDockerCmd(ctx, "ps", "-a", "--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID), "--format", "{{.ID}}")
+	if err != nil || exitCode != 0 || strings.TrimSpace(stdout) == "" {
+		return fmt.Errorf("%w: verified session label %s not found on active containers", ErrResourceMismatch, sessionID)
+	}
+	return nil
+}
+
 func (c *CLIClient) ComposeDown(ctx context.Context, projectName, composeFilePath string) error {
 	_, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "down", "-v", "--remove-orphans")
 	if err != nil || exitCode != 0 {
@@ -119,14 +123,16 @@ func (c *CLIClient) ComposeDown(ctx context.Context, projectName, composeFilePat
 	return nil
 }
 
-// Invariant 2: Agent commands execute only in a verified runner container via 'docker compose exec'.
+// Invariant 2 & Internal Timeout Enforcement: Wrap command with internal GNU timeout inside runner container.
 func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, agentCmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	execCtx := ctx
-	var cancel context.CancelFunc
-	if timeout > 0 {
-		execCtx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	// Give controller host command context a small grace period beyond internal timeout
+	hostTimeout := timeout + 5*time.Second
+	if timeout <= 0 {
+		hostTimeout = 35 * time.Second
 	}
+
+	execCtx, cancel := context.WithTimeout(ctx, hostTimeout)
+	defer cancel()
 
 	args := []string{
 		"compose", "-p", projectName, "-f", composeFilePath,
@@ -137,8 +143,14 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
 
-	// Exec inside the runner container using bash -lc. Note: This bash -lc is INSIDE the runner container!
-	args = append(args, "runner", "bash", "-lc", agentCmd)
+	// Internal GNU timeout inside runner container
+	timeoutSec := int(timeout.Seconds())
+	if timeoutSec <= 0 {
+		timeoutSec = 30
+	}
+	wrappedCmd := fmt.Sprintf("timeout --signal=TERM --kill-after=2s %ds bash -lc %q", timeoutSec, agentCmd)
+
+	args = append(args, "runner", "sh", "-c", wrappedCmd)
 
 	cmd := exec.CommandContext(execCtx, c.dockerBin, args...)
 
@@ -149,17 +161,17 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 
 	execErr := cmd.Run()
 
-	if execCtx.Err() == context.DeadlineExceeded {
-		timedOut = true
-	}
-
 	exitCode = 0
 	if execErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(execErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
-		} else if timedOut {
-			exitCode = 124 // Standard timeout exit code
+			if exitCode == 124 || exitCode == 137 {
+				timedOut = true
+			}
+		} else if execCtx.Err() == context.DeadlineExceeded {
+			timedOut = true
+			exitCode = 124
 		} else {
 			exitCode = -1
 		}
@@ -170,7 +182,6 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 }
 
 func (c *CLIClient) CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error {
-	// Find runner container ID for project
 	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "ps", "-q", "runner")
 	if err != nil || exitCode != 0 || strings.TrimSpace(stdout) == "" {
 		return fmt.Errorf("%w: failed to get runner container ID: %s", ErrDockerExecFailed, stderr)

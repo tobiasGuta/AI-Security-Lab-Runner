@@ -1,34 +1,32 @@
-# AI Security Lab Runner Architecture
+# Architecture Overview
 
-## Overview
+## System Architecture
 
-`AI Security Lab Runner` (`lab-runner`) is a production-quality local execution system written in Go. It enables AI coding assistants and security-analysis agents to safely execute commands inside disposable, locally controlled Docker environments.
-
-```
+```text
 AI client or human operator
         |
         | MCP stdio or CLI
         v
-Go-based AI Security Lab Runner
+Go sandbox controller (lab-runner)
         |
-        | validated and fixed Docker operations
+        | fixed Docker CLI operations
         v
-Disposable Docker Compose project
+Disposable runner container
         |
-        +-- target container or containers
-        |
-        +-- dedicated runner container
-                |
-                +-- /workspace  read-only project source
-                +-- /scratch    writable agent workspace
-                +-- /tmp        writable temporary filesystem
+        +-- /scratch     writable persistent session volume
+        +-- /tmp         writable tmpfs (128m)
+        +-- outbound network access
+        +-- access to host-published services (host.docker.internal)
+        +-- no host filesystem mounts
+        +-- no Docker socket
+        +-- no target container managed by controller
 ```
 
-## Security Invariants & Boundaries
+---
 
-1. **Host Shell Prohibition**: Agent commands NEVER execute on the host (no `powershell`, `cmd`, `bash`, `zsh`, or `WSL` host invocation).
-2. **Container Execution Only**: Commands execute exclusively inside the runner container (`runner bash -lc "<command>"`).
-3. **No Socket Exposure**: Docker socket is NEVER mounted into any container.
-4. **Read-Only Workspace**: `/workspace` is mounted read-only (`:ro`).
-5. **Restricted Writable Storage**: `/scratch` (dedicated volume) is the only persistent writable workspace. `/tmp` uses tmpfs (128m).
-6. **Internal Networking**: Target and runner containers communicate on a private Docker internal network without internet egress by default.
+## Key Components
+
+1. **Go Sandbox Controller**: Manages session lifecycles, runs fixed `docker` / `docker compose` subcommands, enforces policies, redacts secrets in audit logs.
+2. **Hardened Runner Container**: Built from `runner/Dockerfile`. Non-root user `agent` (UID 10001), read-only root filesystem, dropped capabilities (`cap_drop: ALL`), `no-new-privileges:true`.
+3. **Symlink-Safe Filesystem Helper (`sandbox-fs`)**: Go binary compiled inside the container image enforcing `/scratch` root containment.
+4. **Host Gateway & Loopback Translation**: Route `localhost` / `127.0.0.1` HTTP requests to `host.docker.internal`.

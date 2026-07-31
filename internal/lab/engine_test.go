@@ -3,11 +3,10 @@ package lab
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/config"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/config"
 )
 
 type MockDockerClient struct{}
@@ -25,7 +24,7 @@ func (m *MockDockerClient) ComposeDown(ctx context.Context, projectName, compose
 	return nil
 }
 func (m *MockDockerClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	return 0, "mock stdout", "", false, false, nil
+	return 0, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}", "", false, false, nil
 }
 func (m *MockDockerClient) CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error {
 	return os.WriteFile(hostDestPath, []byte("mock export data"), 0644)
@@ -33,39 +32,18 @@ func (m *MockDockerClient) CopyFileFromRunner(ctx context.Context, projectName, 
 func (m *MockDockerClient) ListManagedResources(ctx context.Context) ([]string, error) {
 	return []string{}, nil
 }
+func (m *MockDockerClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error {
+	return nil
+}
 
-func TestListProjectsAndStart(t *testing.T) {
-	tempLabRoot, err := os.MkdirTemp("", "lab_root_*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempLabRoot)
-
-	tempState, err := os.MkdirTemp("", "lab_state_*")
+func TestSandboxEngineStartAndRequest(t *testing.T) {
+	tempState, err := os.MkdirTemp("", "sandbox_state_*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tempState)
 
-	labDir := filepath.Join(tempLabRoot, "demo-lab")
-	if err := os.MkdirAll(labDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	manifestContent := `
-version: 1
-name: "demo-lab"
-description: "Demo Lab"
-targets:
-  - name: "target"
-    internal_port: 80
-`
-	if err := os.WriteFile(filepath.Join(labDir, "labrunner.yaml"), []byte(manifestContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-
 	cfg := config.DefaultConfig()
-	cfg.LabRoot = tempLabRoot
 	cfg.StateDir = tempState
 
 	eng, err := NewEngine(cfg, &MockDockerClient{}, nil)
@@ -73,17 +51,32 @@ targets:
 		t.Fatalf("NewEngine failed: %v", err)
 	}
 
-	projs, err := eng.ListProjects()
-	if err != nil || len(projs) != 1 {
-		t.Fatalf("ListProjects failed: len=%d, err=%v", len(projs), err)
-	}
-
-	res, err := eng.StartSession(context.Background(), "demo-lab", false)
+	startRes, err := eng.StartSession(context.Background(), true, true, 60)
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
 
-	if res.SessionID == "" || res.Project != "demo-lab" {
-		t.Errorf("StartSession result unexpected: %+v", res)
+	if startRes.SessionID == "" || startRes.Status != "ready" {
+		t.Errorf("StartSession result unexpected: %+v", startRes)
+	}
+
+	// Test Localhost Translation in HTTPRequest
+	reqRes, err := eng.HTTPRequest(context.Background(), HTTPRequestOptions{
+		SessionID: startRes.SessionID,
+		Method:    "GET",
+		URL:       "http://localhost:3000/api/info",
+	})
+	if err != nil {
+		t.Fatalf("HTTPRequest failed: %v", err)
+	}
+
+	if !reqRes.HostGatewayTranslation {
+		t.Errorf("expected HostGatewayTranslation to be true for localhost URL")
+	}
+	if reqRes.ConnectionHost != "host.docker.internal" {
+		t.Errorf("expected ConnectionHost to be host.docker.internal, got %s", reqRes.ConnectionHost)
+	}
+	if reqRes.StatusCode != 200 {
+		t.Errorf("expected status code 200, got %d", reqRes.StatusCode)
 	}
 }

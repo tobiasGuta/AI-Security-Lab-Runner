@@ -1,47 +1,44 @@
 # CLI Reference
 
-The compiled binary `lab-runner` exposes subcommands for human operators and CLI-based automation.
+## Commands Overview
 
-## Commands
+```powershell
+# One-shot command execution with auto-cleanup
+lab-runner sandbox run -- curl -s https://example.com
 
-### `lab-runner serve [--config <path>]`
-Starts the MCP stdio server.
-- Standard input reads JSON-RPC 2.0 requests.
-- Standard output receives ONLY protocol messages.
-- Standard error receives diagnostics and logs.
+# Start persistent sandbox session
+lab-runner sandbox start [--ttl 60]
 
-### `lab-runner doctor [--json]`
-Checks environment readiness, Docker daemon connectivity, Compose v2 availability, path safety, and active session health.
+# Execute command inside active session
+lab-runner sandbox exec <session-id> -- id
 
-### `lab-runner projects list [--json]`
-Lists discovered lab environments under `lab_root`.
+# Make structured HTTP request (with localhost translation)
+lab-runner sandbox request --url http://localhost:3000/api/info --method GET
 
-### `lab-runner start <project-name> [--rebuild] [--json]`
-Starts disposable target and runner containers for the specified lab project.
+# Write file to /scratch
+lab-runner sandbox write <session-id> /scratch/script.py --file ./script.py
 
-### `lab-runner exec <session-id> [--cwd <path>] [--timeout <sec>] [--json] -- <command...>`
-Executes a command inside the runner container.
+# Read file from /scratch
+lab-runner sandbox read <session-id> /scratch/output.txt
 
-### `lab-runner read <session-id> <container-path> [--max-bytes <n>]`
-Reads file content from `/workspace` or `/scratch` inside the runner container.
+# Query sandbox status
+lab-runner sandbox status [session-id]
 
-### `lab-runner write <session-id> <scratch-path> [--file <path>] [--stdin] [--overwrite]`
-Writes content to a file strictly under `/scratch` in the runner container.
+# Stop sandbox session
+lab-runner sandbox stop <session-id>
 
-### `lab-runner status [session-id] [--json]`
-Displays active session state and health status.
+# Reset session
+lab-runner sandbox reset <session-id>
 
-### `lab-runner export <session-id> <scratch-path> [destination-name]`
-Exports a regular file from `/scratch` to the host export directory (when enabled by global configuration).
+# Start stdio MCP server
+lab-runner serve
 
-### `lab-runner reset <session-id> [--rebuild]`
-Destroys session containers/volumes and recreates them from manifest.
+# Infrastructure health check
+lab-runner doctor [--json]
 
-### `lab-runner stop <session-id>`
-Stops session containers and removes disposable resources.
+# Cleanup stale managed resources
+lab-runner cleanup [--dry-run]
 
-### `lab-runner cleanup [--stale] [--all-owned] [--dry-run]`
-Removes application-owned Docker resources identified by `ai.security.lab-runner.managed=true`.
-
-### `lab-runner version [--json]`
-Displays application version, Go runtime version, commit, and schema versions.
+# Version information
+lab-runner version [--json]
+```

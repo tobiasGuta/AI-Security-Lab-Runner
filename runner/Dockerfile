@@ -39,14 +39,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Invariant 18: The runner uses a non-root user (agent: 10001).
+# Compile and install trusted sandbox-fs helper binary
+COPY sandbox-fs /tmp/sandbox-fs-build
+RUN cd /tmp/sandbox-fs-build && go build -o /usr/local/bin/sandbox-fs main.go && rm -rf /tmp/sandbox-fs-build
+
+# Non-root user setup (agent: 10001)
 RUN groupadd -g 10001 agent && \
     useradd -u 10001 -g agent -m -s /bin/bash agent
 
-RUN mkdir -p /workspace /scratch /tmp && \
-    chown -R agent:agent /workspace /scratch /tmp
+RUN mkdir -p /scratch /tmp && \
+    chown -R agent:agent /scratch /tmp
 
 USER agent
-WORKDIR /workspace
+WORKDIR /scratch
 
 CMD ["sleep", "infinity"]

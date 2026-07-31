@@ -1,12 +1,11 @@
 {
   "mcpServers": {
-    "security-lab-runner": {
+    "ai-security-sandbox": {
       "command": "C:\\Tools\\Lab-Runner\\lab-runner.exe",
-      "args": [
-        "serve",
-        "--config",
-        "C:\\Tools\\Lab-Runner\\config.yaml"
-      ]
+      "args": ["serve"],
+      "env": {
+        "LAB_RUNNER_STATE_DIR": "C:\\Users\\ExampleUser\\.ai-security-lab-runner"
+      }
     }
   }
 }

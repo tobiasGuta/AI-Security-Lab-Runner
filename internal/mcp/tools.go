@@ -3,45 +3,57 @@ package mcp
 func GetDefinedTools() []Tool {
 	return []Tool{
 		{
-			Name:        "lab_list_projects",
-			Description: "List available disposable security lab environments under lab_root.",
+			Name:        "sandbox_run",
+			Description: "Execute a one-shot command inside a disposable, ephemeral sandbox runner container with automatic cleanup.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
-					"include_invalid": {
-						Type:        "boolean",
-						Description: "If true, includes projects that failed manifest validation.",
-					},
-				},
-			},
-		},
-		{
-			Name:        "lab_start",
-			Description: "Start disposable target and runner containers for a given lab project.",
-			InputSchema: ToolSchema{
-				Type: "object",
-				Properties: map[string]SchemaProperty{
-					"project": {
+					"command": {
 						Type:        "string",
-						Description: "Relative identifier of the lab project to start.",
+						Description: "Command to execute inside disposable sandbox (e.g. 'curl -s https://example.com').",
 					},
-					"rebuild": {
-						Type:        "boolean",
-						Description: "Force rebuild of container images.",
+					"cwd": {
+						Type:        "string",
+						Description: "Working directory in sandbox (/scratch or descendant).",
+					},
+					"timeout_seconds": {
+						Type:        "integer",
+						Description: "Execution timeout in seconds.",
 					},
 				},
-				Required: []string{"project"},
+				Required: []string{"command"},
 			},
 		},
 		{
-			Name:        "lab_exec",
-			Description: "Execute a command inside the disposable runner container. NEVER runs on the host.",
+			Name:        "sandbox_start",
+			Description: "Start a persistent sandbox session with outbound network access and host-gateway support.",
+			InputSchema: ToolSchema{
+				Type: "object",
+				Properties: map[string]SchemaProperty{
+					"outbound_network": {
+						Type:        "boolean",
+						Description: "Enable outbound internet access.",
+					},
+					"host_access": {
+						Type:        "boolean",
+						Description: "Enable host gateway mapping for accessing host-published applications.",
+					},
+					"ttl_minutes": {
+						Type:        "integer",
+						Description: "Session time-to-live in minutes.",
+					},
+				},
+			},
+		},
+		{
+			Name:        "sandbox_exec",
+			Description: "Execute a command inside a persistent sandbox session runner container.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
 					"session_id": {
 						Type:        "string",
-						Description: "Active lab session ID.",
+						Description: "Active sandbox session ID.",
 					},
 					"command": {
 						Type:        "string",
@@ -49,7 +61,7 @@ func GetDefinedTools() []Tool {
 					},
 					"cwd": {
 						Type:        "string",
-						Description: "Working directory in runner (/workspace, /scratch, or safe descendant).",
+						Description: "Working directory inside runner (/scratch or descendant).",
 					},
 					"timeout_seconds": {
 						Type:        "integer",
@@ -60,40 +72,56 @@ func GetDefinedTools() []Tool {
 			},
 		},
 		{
-			Name:        "lab_read_file",
-			Description: "Read a file from /workspace or /scratch inside the runner container.",
+			Name:        "sandbox_http_request",
+			Description: "Make a structured HTTP/HTTPS request inside the sandbox. Loopback URLs (localhost/127.0.0.1) automatically map to host-published services.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
 					"session_id": {
 						Type:        "string",
-						Description: "Active lab session ID.",
+						Description: "Optional active session ID. If omitted, uses a disposable ephemeral runner.",
 					},
-					"path": {
+					"method": {
 						Type:        "string",
-						Description: "Container file path (/workspace/... or /scratch/...).",
+						Description: "HTTP method (GET, POST, PUT, DELETE, etc.).",
 					},
-					"offset": {
-						Type:        "integer",
-						Description: "Byte offset to start reading from.",
+					"url": {
+						Type:        "string",
+						Description: "Target URL (e.g. 'https://example.com' or 'http://localhost:3000/api').",
 					},
-					"maximum_bytes": {
+					"headers": {
+						Type:        "object",
+						Description: "HTTP headers map.",
+					},
+					"body": {
+						Type:        "string",
+						Description: "Request body content.",
+					},
+					"follow_redirects": {
+						Type:        "boolean",
+						Description: "Follow HTTP redirects (-L).",
+					},
+					"insecure_tls": {
+						Type:        "boolean",
+						Description: "Allow insecure TLS certificates (-k).",
+					},
+					"timeout_seconds": {
 						Type:        "integer",
-						Description: "Maximum bytes to read.",
+						Description: "Timeout in seconds.",
 					},
 				},
-				Required: []string{"session_id", "path"},
+				Required: []string{"url"},
 			},
 		},
 		{
-			Name:        "lab_write_scratch",
-			Description: "Write a script or file strictly under /scratch in the runner container.",
+			Name:        "sandbox_write_file",
+			Description: "Write a script or data file strictly under /scratch in the sandbox container.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
 					"session_id": {
 						Type:        "string",
-						Description: "Active lab session ID.",
+						Description: "Active sandbox session ID.",
 					},
 					"path": {
 						Type:        "string",
@@ -116,8 +144,38 @@ func GetDefinedTools() []Tool {
 			},
 		},
 		{
-			Name:        "lab_status",
-			Description: "Show active lab session status.",
+			Name:        "sandbox_read_file",
+			Description: "Read a file strictly under /scratch inside the sandbox container.",
+			InputSchema: ToolSchema{
+				Type: "object",
+				Properties: map[string]SchemaProperty{
+					"session_id": {
+						Type:        "string",
+						Description: "Active sandbox session ID.",
+					},
+					"path": {
+						Type:        "string",
+						Description: "Container file path under /scratch.",
+					},
+					"offset": {
+						Type:        "integer",
+						Description: "Byte offset to start reading from.",
+					},
+					"maximum_bytes": {
+						Type:        "integer",
+						Description: "Maximum bytes to read.",
+					},
+					"binary_encoding": {
+						Type:        "string",
+						Description: "Binary encoding ('base64' or 'utf-8').",
+					},
+				},
+				Required: []string{"session_id", "path"},
+			},
+		},
+		{
+			Name:        "sandbox_status",
+			Description: "Show active sandbox sessions and status metadata.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -129,48 +187,8 @@ func GetDefinedTools() []Tool {
 			},
 		},
 		{
-			Name:        "lab_export_file",
-			Description: "Export one regular file from /scratch to host export directory (disabled by default).",
-			InputSchema: ToolSchema{
-				Type: "object",
-				Properties: map[string]SchemaProperty{
-					"session_id": {
-						Type:        "string",
-						Description: "Active lab session ID.",
-					},
-					"path": {
-						Type:        "string",
-						Description: "Scratch file path (/scratch/...).",
-					},
-					"destination_name": {
-						Type:        "string",
-						Description: "Filename in host export directory.",
-					},
-				},
-				Required: []string{"session_id", "path"},
-			},
-		},
-		{
-			Name:        "lab_reset",
-			Description: "Destroy and recreate a lab session from manifest.",
-			InputSchema: ToolSchema{
-				Type: "object",
-				Properties: map[string]SchemaProperty{
-					"session_id": {
-						Type:        "string",
-						Description: "Active session ID to reset.",
-					},
-					"rebuild": {
-						Type:        "boolean",
-						Description: "Force rebuild of images.",
-					},
-				},
-				Required: []string{"session_id"},
-			},
-		},
-		{
-			Name:        "lab_stop",
-			Description: "Stop a lab session and destroy owned containers/networks.",
+			Name:        "sandbox_stop",
+			Description: "Stop a sandbox session and destroy runner containers and scratch volume.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -187,14 +205,28 @@ func GetDefinedTools() []Tool {
 			},
 		},
 		{
-			Name:        "lab_get_audit_summary",
-			Description: "Get a redacted audit trail summary for a session.",
+			Name:        "sandbox_reset",
+			Description: "Recreate a persistent sandbox session with the same policy snapshot.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
 					"session_id": {
 						Type:        "string",
-						Description: "Session ID to retrieve audit for.",
+						Description: "Active session ID to reset.",
+					},
+				},
+				Required: []string{"session_id"},
+			},
+		},
+		{
+			Name:        "sandbox_get_audit_summary",
+			Description: "Retrieve redacted audit log events for a sandbox session.",
+			InputSchema: ToolSchema{
+				Type: "object",
+				Properties: map[string]SchemaProperty{
+					"session_id": {
+						Type:        "string",
+						Description: "Session ID to retrieve audit events for.",
 					},
 					"limit": {
 						Type:        "integer",

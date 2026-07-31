@@ -1,6 +1,8 @@
 package audit
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,19 +12,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/pathsafe"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/pathsafe"
 )
 
 var (
 	ErrAuditFailed = errors.New("audit log write failed")
 
-	// Secret redaction patterns
 	secretPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(authorization:\s*)(bearer|basic)\s+[a-zA-Z0-9._~+/-]+=*`),
 		regexp.MustCompile(`(?i)(cookie:\s*)[^\r\n]+`),
 		regexp.MustCompile(`(?i)(api[_-]?key|secret|password|token|auth_token)\s*[:=]\s*["']?[a-zA-Z0-9._~+/-]+["']?`),
 		regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`),
-		regexp.MustCompile(`(?i)(AKIA[0-9A-Z]{16})`), // AWS Access Key ID
+		regexp.MustCompile(`(?i)(AKIA[0-9A-Z]{16})`),
 	}
 )
 
@@ -30,7 +31,6 @@ type Event struct {
 	Timestamp       string                 `json:"timestamp"`
 	EventID         string                 `json:"event_id"`
 	SessionID       string                 `json:"session_id,omitempty"`
-	Project         string                 `json:"project,omitempty"`
 	Interface       string                 `json:"interface"` // "mcp" or "cli"
 	ToolOrCommand   string                 `json:"tool_or_command"`
 	DurationMS      int64                  `json:"duration_ms,omitempty"`
@@ -49,7 +49,6 @@ type Logger struct {
 	redactSecrets bool
 }
 
-// Invariant 20: Secrets are redacted from audit records.
 func NewLogger(logFilePath string, redactSecrets bool) (*Logger, error) {
 	if logFilePath == "" {
 		return nil, fmt.Errorf("audit log file path cannot be empty")
@@ -71,6 +70,12 @@ func NewLogger(logFilePath string, redactSecrets bool) (*Logger, error) {
 	}, nil
 }
 
+func GenerateEventID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("evt_%s", hex.EncodeToString(b))
+}
+
 func (l *Logger) Log(event Event) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -79,7 +84,7 @@ func (l *Logger) Log(event Event) error {
 		event.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	if event.EventID == "" {
-		event.EventID = fmt.Sprintf("evt_%d", time.Now().UnixNano())
+		event.EventID = GenerateEventID()
 	}
 
 	if l.redactSecrets {
@@ -110,6 +115,37 @@ func (l *Logger) Log(event Event) error {
 	}
 
 	return nil
+}
+
+func (l *Logger) GetSummaryForSession(sessionID string, limit int) ([]Event, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	f, err := os.Open(l.logFilePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Event{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var events []Event
+	decoder := json.NewDecoder(f)
+	for decoder.More() {
+		var evt Event
+		if err := decoder.Decode(&evt); err == nil {
+			if evt.SessionID == sessionID {
+				events = append(events, evt)
+			}
+		}
+	}
+
+	if limit > 0 && len(events) > limit {
+		events = events[len(events)-limit:]
+	}
+
+	return events, nil
 }
 
 func (l *Logger) Redact(input string) string {

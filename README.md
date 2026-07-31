@@ -1,79 +1,96 @@
-# AI Security Lab Runner (`lab-runner`)
+# AI Security Lab Runner (lab-runner)
 
-[![CI](https://github.com/ai-security-lab-runner/lab-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/ai-security-lab-runner/lab-runner/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/tobiasGuta/AI-Security-Lab-Runner-/actions/workflows/ci.yml/badge.svg)](https://github.com/tobiasGuta/AI-Security-Lab-Runner-/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.24-blue.svg)](https://go.dev)
+[![Docker](https://img.shields.io/badge/Docker-Required-blue.svg)](https://www.docker.com)
 
-**AI Security Lab Runner** (`lab-runner`) is an authorized, defensive-development local execution system written in Go. It enables AI coding assistants, security-analysis agents, IDE plugins, and automation scripts to safely execute commands inside disposable, restricted Docker environments.
-
----
-
-## Key Security Features
-
-- **No Host Command Execution**: Agent commands NEVER run on the host system.
-- **No Docker Socket Access**: The host Docker socket is NEVER exposed to containers.
-- **Read-Only Workspace**: Source code is mounted into `/workspace` strictly read-only (`:ro`).
-- **Dedicated Writable Directory**: `/scratch` is the only writable persistent directory for agent proof-of-concept scripts.
-- **Internal Network Isolation**: Containers communicate on an internal Docker network with no default internet egress.
-- **Hardened Runner Container**: Non-root user `agent` (UID 10001), dropped capabilities (`cap_drop: ALL`), and `no-new-privileges:true`.
-- **Secret Redaction**: Automatic redaction of sensitive credentials, API keys, and auth headers from JSONL audit logs.
+**AI Security Lab Runner** is a generic, network-enabled AI execution sandbox system. It enables AI coding assistants, security-analysis agents, and human developers to safely execute commands, run tools, and make HTTP requests inside disposable, hardened local Docker environments.
 
 ---
 
-## Quick Start
+## Key Features
 
-### 1. Build
+- **No Project Declarations**: Ask your AI assistant to run `curl https://example.com` or test `http://localhost:3000/api` immediately—no `labrunner.yaml`, project imports, or target container definitions required.
+- **Outbound Internet Access**: Direct, controlled network access to public web destinations and APIs.
+- **Host-Local Application Access**: Connect to applications already running on your host machine (e.g. `http://localhost:3000`) through `host.docker.internal` mapping.
+- **One-Shot & Persistent Workflows**: Supports one-shot ephemeral executions (`sandbox_run`) and persistent stateful sessions (`sandbox_start`, `sandbox_exec`, `sandbox_http_request`).
+- **Hardened Runner Environment**: Non-root user (`agent` UID 10001), read-only root filesystem, dropped Linux capabilities (`cap_drop: ALL`), `no-new-privileges`, dedicated `/scratch` volume, tmpfs `/tmp`.
+- **Symlink-Safe Filesystem Operations**: Embedded `sandbox-fs` helper prevents symlink escapes outside `/scratch`.
+- **MCP Protocol Native**: Stdio server exposing 10 `sandbox_*` tools for any MCP-compatible AI client (Claude, Gemini, OpenAI, IDE agents, custom automation).
+
+---
+
+## Quickstart
+
+### 1. Build the Binary & Runner Image
 
 ```powershell
-# Windows
-.\scripts\build.ps1
+# Build lab-runner executable
+go build -o lab-runner.exe ./cmd/lab-runner
 
-# Linux / macOS
-./scripts/build.sh
+# Build runner container image
+docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/
 ```
 
-### 2. Verify System Readiness
+### 2. Verify Infrastructure
 
-```bash
-lab-runner doctor
+```powershell
+.\lab-runner.exe doctor
 ```
 
-### 3. Usage Example
+### 3. Run a One-Shot Command
 
-```bash
-# List available lab projects
-lab-runner projects list
+```powershell
+.\lab-runner.exe sandbox run -- curl -s https://example.com
+```
 
-# Start a lab session
-lab-runner start hello-web-lab
+### 4. Make an HTTP Request to a Host-Published Service
 
-# Execute command inside runner container (target reachability check)
-lab-runner exec <session-id> -- curl -s http://target:3000/api/info
-
-# Write script to /scratch
-lab-runner write <session-id> /scratch/test.py --file ./local-script.py
-
-# Execute Python script inside runner container
-lab-runner exec <session-id> -- python3 /scratch/test.py
-
-# Read result
-lab-runner read <session-id> /scratch/result.json
-
-# Stop lab session
-lab-runner stop <session-id>
+```powershell
+.\lab-runner.exe sandbox request --url http://localhost:3000/api/info --method GET
 ```
 
 ---
 
-## Documentation Index
+## MCP Integration
 
-- [Architecture](docs/ARCHITECTURE.md)
+Configure your MCP client (e.g., Claude Desktop, Antigravity, VS Code MCP extension):
+
+```json
+{
+  "mcpServers": {
+    "ai-security-sandbox": {
+      "command": "D:\\Tools\\Lab-Runner\\lab-runner.exe",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+| Tool | Purpose |
+| :--- | :--- |
+| `sandbox_run` | One-shot command in a disposable container with auto-cleanup |
+| `sandbox_start` | Start persistent sandbox session |
+| `sandbox_exec` | Execute command in active sandbox session |
+| `sandbox_http_request` | Structured HTTP request with automatic loopback translation |
+| `sandbox_write_file` | Symlink-safe file write strictly beneath `/scratch` |
+| `sandbox_read_file` | Symlink-safe file read strictly beneath `/scratch` |
+| `sandbox_status` | Query active session status |
+| `sandbox_stop` | Stop session and destroy runner containers & volume |
+| `sandbox_reset` | Recreate sandbox session with same policy |
+| `sandbox_get_audit_summary` | Retrieve redacted audit log events |
+
+---
+
+## Documentation
+
+- [Architecture Overview](docs/ARCHITECTURE.md)
 - [CLI Reference](docs/CLI_REFERENCE.md)
 - [Configuration Guide](docs/CONFIGURATION.md)
-- [Lab Format Specification](docs/LAB_FORMAT.md)
 - [MCP Integration Guide](docs/MCP_INTEGRATION.md)
-- [Security Model](docs/SECURITY_MODEL.md)
-- [Threat Model](docs/THREAT_MODEL.md)
-- [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Windows Setup](docs/WINDOWS_SETUP.md)
-- [Linux Setup](docs/LINUX_SETUP.md)
-- [macOS Setup](docs/MACOS_SETUP.md)
+- [Network Access & Host Gateway](docs/NETWORK_ACCESS.md)
+- [Security & Threat Model](docs/SECURITY_MODEL.md)
+- [Troubleshooting Guide](docs/TROUBLESHOOTING.md)

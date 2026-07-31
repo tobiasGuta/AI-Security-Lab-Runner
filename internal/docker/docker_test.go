@@ -4,31 +4,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/config"
-	"github.com/ai-security-lab-runner/lab-runner/internal/manifest"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/config"
 )
 
-func TestGenerateComposeYAML(t *testing.T) {
+func TestGenerateComposeYAMLRunnerOnly(t *testing.T) {
 	cfg := config.DefaultConfig()
-	m := &manifest.LabManifest{
-		Version:     1,
-		Name:        "test-lab",
-		Description: "Test Compose Generation",
-		Workspace:   ".",
-		Targets: []manifest.TargetSpec{
-			{
-				Name:         "target",
-				Image:        "nginx:alpine",
-				InternalPort: 80,
-				Limits: manifest.ResourceLimits{
-					TargetMemory: "256m",
-					TargetCPUs:   0.5,
-				},
-			},
-		},
-	}
 
-	yamlStr, err := GenerateComposeYAML("sess-12345", m, cfg, "/labs/test-lab")
+	yamlStr, err := GenerateComposeYAML("sess-12345", cfg)
 	if err != nil {
 		t.Fatalf("GenerateComposeYAML failed: %v", err)
 	}
@@ -37,11 +19,15 @@ func TestGenerateComposeYAML(t *testing.T) {
 		t.Errorf("expected session label in generated compose")
 	}
 
-	if !strings.Contains(yamlStr, "read_only: true") {
-		t.Errorf("expected read_only: true in services")
+	if !strings.Contains(yamlStr, "host.docker.internal:host-gateway") {
+		t.Errorf("expected host-gateway extra_hosts mapping")
 	}
 
-	if !strings.Contains(yamlStr, "internal: true") {
-		t.Errorf("expected internal: true network")
+	if !strings.Contains(yamlStr, "read_only: true") {
+		t.Errorf("expected read_only: true in runner service")
+	}
+
+	if strings.Contains(yamlStr, "workspace") {
+		t.Errorf("expected NO workspace mount in generic sandbox architecture")
 	}
 }

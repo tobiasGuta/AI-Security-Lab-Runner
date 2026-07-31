@@ -9,7 +9,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/lab"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/lab"
 )
 
 type Server struct {
@@ -33,7 +33,8 @@ func NewServer(engine *lab.Engine, in io.Reader, out io.Writer) *Server {
 	}
 }
 
-// Invariant 19: MCP stdout contains no non-protocol output.
+// Serve handles incoming JSON-RPC stdio frames.
+// Invariant 19: stdout contains no non-protocol output.
 func (s *Server) Serve(ctx context.Context) error {
 	reader := bufio.NewReader(s.in)
 
@@ -75,14 +76,13 @@ func (s *Server) handleRequest(ctx context.Context, req JSONRPCRequest) {
 				"tools": map[string]interface{}{},
 			},
 			"serverInfo": map[string]interface{}{
-				"name":    "ai-security-lab-runner",
-				"version": "1.0.0",
+				"name":    "ai-security-sandbox",
+				"version": "2.0.0",
 			},
 		}
 		s.sendResult(req.ID, result)
 
 	case "notifications/initialized":
-		// No response required for notification
 
 	case "ping":
 		s.sendResult(req.ID, map[string]interface{}{})
@@ -135,37 +135,28 @@ func (s *Server) handleToolCall(ctx context.Context, req JSONRPCRequest) {
 
 func (s *Server) executeTool(ctx context.Context, name string, args json.RawMessage) (interface{}, error) {
 	switch name {
-	case "lab_list_projects":
+	case "sandbox_run":
 		var p struct {
-			IncludeInvalid bool `json:"include_invalid"`
-		}
-		_ = json.Unmarshal(args, &p)
-		projects, err := s.engine.ListProjects()
-		if err != nil {
-			return nil, err
-		}
-		if !p.IncludeInvalid {
-			var filtered []lab.ProjectInfo
-			for _, proj := range projects {
-				if proj.IsValid {
-					filtered = append(filtered, proj)
-				}
-			}
-			return filtered, nil
-		}
-		return projects, nil
-
-	case "lab_start":
-		var p struct {
-			Project string `json:"project"`
-			Rebuild bool   `json:"rebuild"`
+			Command        string            `json:"command"`
+			CWD            string            `json:"cwd"`
+			TimeoutSeconds int               `json:"timeout_seconds"`
+			Environment    map[string]string `json:"environment"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		return s.engine.StartSession(ctx, p.Project, p.Rebuild)
+		return s.engine.Run(ctx, p.Command, p.CWD, p.TimeoutSeconds, p.Environment)
 
-	case "lab_exec":
+	case "sandbox_start":
+		var p struct {
+			OutboundNetwork bool `json:"outbound_network"`
+			HostAccess      bool `json:"host_access"`
+			TTLMinutes      int  `json:"ttl_minutes"`
+		}
+		_ = json.Unmarshal(args, &p)
+		return s.engine.StartSession(ctx, p.OutboundNetwork, p.HostAccess, p.TTLMinutes)
+
+	case "sandbox_exec":
 		var p struct {
 			SessionID      string            `json:"session_id"`
 			Command        string            `json:"command"`
@@ -178,19 +169,14 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		}
 		return s.engine.Exec(ctx, p.SessionID, p.Command, p.CWD, p.TimeoutSeconds, p.Environment)
 
-	case "lab_read_file":
-		var p struct {
-			SessionID    string `json:"session_id"`
-			Path         string `json:"path"`
-			Offset       int64  `json:"offset"`
-			MaximumBytes int64  `json:"maximum_bytes"`
-		}
-		if err := json.Unmarshal(args, &p); err != nil {
+	case "sandbox_http_request":
+		var opts lab.HTTPRequestOptions
+		if err := json.Unmarshal(args, &opts); err != nil {
 			return nil, err
 		}
-		return s.engine.ReadFile(ctx, p.SessionID, p.Path, p.Offset, p.MaximumBytes)
+		return s.engine.HTTPRequest(ctx, opts)
 
-	case "lab_write_scratch":
+	case "sandbox_write_file":
 		var p struct {
 			SessionID string `json:"session_id"`
 			Path      string `json:"path"`
@@ -201,40 +187,29 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		return s.engine.WriteScratch(ctx, p.SessionID, p.Path, p.Content, p.Encoding, p.Overwrite)
+		return s.engine.WriteFile(ctx, p.SessionID, p.Path, p.Content, p.Encoding, p.Overwrite)
 
-	case "lab_status":
+	case "sandbox_read_file":
+		var p struct {
+			SessionID      string `json:"session_id"`
+			Path           string `json:"path"`
+			Offset         int64  `json:"offset"`
+			MaximumBytes   int64  `json:"maximum_bytes"`
+			BinaryEncoding string `json:"binary_encoding"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		return s.engine.ReadFile(ctx, p.SessionID, p.Path, p.Offset, p.MaximumBytes, p.BinaryEncoding)
+
+	case "sandbox_status":
 		var p struct {
 			SessionID string `json:"session_id"`
 		}
 		_ = json.Unmarshal(args, &p)
-		if p.SessionID != "" {
-			return s.engine.GetSessionStatus(p.SessionID)
-		}
-		return s.engine.ListSessions(), nil
+		return s.engine.Status(p.SessionID)
 
-	case "lab_export_file":
-		var p struct {
-			SessionID       string `json:"session_id"`
-			Path            string `json:"path"`
-			DestinationName string `json:"destination_name"`
-		}
-		if err := json.Unmarshal(args, &p); err != nil {
-			return nil, err
-		}
-		return s.engine.ExportFile(ctx, p.SessionID, p.Path, p.DestinationName)
-
-	case "lab_reset":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Rebuild   bool   `json:"rebuild"`
-		}
-		if err := json.Unmarshal(args, &p); err != nil {
-			return nil, err
-		}
-		return s.engine.ResetSession(ctx, p.SessionID, p.Rebuild)
-
-	case "lab_stop":
+	case "sandbox_stop":
 		var p struct {
 			SessionID       string `json:"session_id"`
 			PreserveScratch bool   `json:"preserve_scratch"`
@@ -248,7 +223,16 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		}
 		return map[string]string{"status": "stopped", "session_id": p.SessionID}, nil
 
-	case "lab_get_audit_summary":
+	case "sandbox_reset":
+		var p struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		return s.engine.ResetSession(ctx, p.SessionID)
+
+	case "sandbox_get_audit_summary":
 		var p struct {
 			SessionID string `json:"session_id"`
 			Limit     int    `json:"limit"`
@@ -256,10 +240,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{
-			"session_id": p.SessionID,
-			"status":     "audit_summary_available",
-		}, nil
+		return s.engine.GetAuditSummary(p.SessionID, p.Limit)
 
 	default:
 		return nil, fmt.Errorf("unknown tool name '%s'", name)

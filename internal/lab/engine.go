@@ -7,24 +7,27 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/audit"
-	"github.com/ai-security-lab-runner/lab-runner/internal/config"
-	"github.com/ai-security-lab-runner/lab-runner/internal/docker"
-	"github.com/ai-security-lab-runner/lab-runner/internal/manifest"
-	"github.com/ai-security-lab-runner/lab-runner/internal/pathsafe"
-	"github.com/ai-security-lab-runner/lab-runner/internal/session"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/audit"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/config"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/docker"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/pathsafe"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/security"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/session"
 )
 
 var (
 	ErrExportDisabled     = errors.New("file export is disabled by security policy")
-	ErrInvalidScratchPath = errors.New("write is restricted strictly to /scratch descendants")
-	ErrExecutionDenied    = errors.New("command execution denied")
+	ErrInvalidScratchPath = errors.New("file operation is restricted strictly to /scratch descendants")
+	ErrInvalidHTTPMethod  = errors.New("invalid or unsupported HTTP method")
+	ErrInvalidHeaderName  = errors.New("invalid HTTP header name")
 )
 
 type Engine struct {
@@ -48,81 +51,132 @@ func NewEngine(cfg *config.Config, dockerClient docker.Client, auditLogger *audi
 	}, nil
 }
 
-type ProjectInfo struct {
-	Name            string `json:"name"`
-	Description     string `json:"description"`
-	Path            string `json:"path"`
-	ManifestVersion int    `json:"manifest_version"`
-	IsValid         bool   `json:"is_valid"`
-	ValidationError string `json:"validation_error,omitempty"`
+type CleanupSummary struct {
+	RunnerRemoved  bool `json:"runner_removed"`
+	ScratchRemoved bool `json:"scratch_removed"`
+	NetworkRemoved bool `json:"network_removed"`
 }
 
-func (e *Engine) ListProjects() ([]ProjectInfo, error) {
-	entries, err := os.ReadDir(e.cfg.LabRoot)
+type RunResult struct {
+	SessionID       string         `json:"session_id"`
+	Ephemeral       bool           `json:"ephemeral"`
+	ExitCode        int            `json:"exit_code"`
+	TimedOut        bool           `json:"timed_out"`
+	DurationMS      int64          `json:"duration_ms"`
+	Stdout          string         `json:"stdout"`
+	Stderr          string         `json:"stderr"`
+	StdoutTruncated bool           `json:"stdout_truncated"`
+	StderrTruncated bool           `json:"stderr_truncated"`
+	Cleanup         CleanupSummary `json:"cleanup"`
+}
+
+// Run executes a one-shot command in a disposable, ephemeral sandbox container with deferred cleanup.
+func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, env map[string]string) (*RunResult, error) {
+	sess, err := e.sessMgr.CreateSession(session.ModeEphemeral, 15)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read lab_root directory '%s': %w", e.cfg.LabRoot, err)
+		return nil, fmt.Errorf("failed to create ephemeral session: %w", err)
 	}
 
-	var projects []ProjectInfo
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		labDir := filepath.Join(e.cfg.LabRoot, entry.Name())
-		info := ProjectInfo{
-			Name: entry.Name(),
-			Path: entry.Name(),
-		}
-
-		mfs, err := manifest.LoadManifest(labDir)
-		if err != nil {
-			info.IsValid = false
-			info.ValidationError = err.Error()
-		} else {
-			info.IsValid = true
-			info.Description = mfs.Description
-			info.ManifestVersion = mfs.Version
-		}
-		projects = append(projects, info)
+	res := &RunResult{
+		SessionID: sess.ID,
+		Ephemeral: true,
 	}
 
-	return projects, nil
+	// Defer auto-cleanup on ALL execution paths (success, failure, timeout, error)
+	defer func() {
+		_ = e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath)
+		_ = e.sessMgr.RemoveSession(sess.ID)
+		res.Cleanup = CleanupSummary{
+			RunnerRemoved:  true,
+			ScratchRemoved: true,
+			NetworkRemoved: true,
+		}
+	}()
+
+	_ = e.sessMgr.Transition(sess.ID, session.StateCreated, session.StateStarting)
+
+	composeContent, err := docker.GenerateComposeYAML(sess.ID, e.cfg)
+	if err != nil {
+		return res, fmt.Errorf("failed to generate compose configuration: %w", err)
+	}
+
+	if err := os.WriteFile(sess.ComposeFilePath, []byte(composeContent), 0600); err != nil {
+		return res, fmt.Errorf("failed to write compose file: %w", err)
+	}
+
+	if err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
+		return res, fmt.Errorf("failed to bring up runner container: %w", err)
+	}
+
+	_ = e.sessMgr.Transition(sess.ID, session.StateStarting, session.StateReady)
+
+	if cwd == "" {
+		cwd = "/scratch"
+	}
+	cleanCwd, err := pathsafe.ValidateContainerPathUnderAllowed(cwd, []string{"/scratch", "/tmp"})
+	if err != nil {
+		return res, fmt.Errorf("invalid working directory: %w", err)
+	}
+
+	start := time.Now()
+	exitCode, stdout, stderr, timedOut, truncated, err := e.dockerClient.ExecInRunner(
+		ctx,
+		sess.ComposeProject,
+		sess.ComposeFilePath,
+		cleanCwd,
+		command,
+		env,
+		time.Duration(timeoutSec)*time.Second,
+		e.cfg.Limits.MaximumOutputBytes,
+	)
+	res.DurationMS = time.Since(start).Milliseconds()
+
+	res.ExitCode = exitCode
+	res.Stdout = stdout
+	res.Stderr = stderr
+	res.TimedOut = timedOut
+	res.StdoutTruncated = truncated
+	res.StderrTruncated = truncated
+
+	if e.auditLogger != nil {
+		_ = e.auditLogger.Log(audit.Event{
+			SessionID:       sess.ID,
+			Interface:       "engine",
+			ToolOrCommand:   "sandbox_run",
+			DurationMS:      res.DurationMS,
+			ExitCode:        &exitCode,
+			TimedOut:        timedOut,
+			OutputTruncated: truncated,
+			RedactedCommand: command,
+		})
+	}
+
+	if err != nil {
+		return res, fmt.Errorf("execution failed: %w", err)
+	}
+
+	return res, nil
 }
 
 type StartResult struct {
-	SessionID    string            `json:"session_id"`
-	Project      string            `json:"project"`
-	InternalURLs map[string]string `json:"internal_urls"`
-	Status       string            `json:"status"`
-	ExpiresAt    time.Time         `json:"expires_at"`
+	SessionID     string                 `json:"session_id"`
+	Status        string                 `json:"status"`
+	CreatedAt     time.Time              `json:"created_at"`
+	ExpiresAt     time.Time              `json:"expires_at"`
+	Network       config.NetworkConfig   `json:"network"`
+	HostGateway   string                 `json:"host_gateway"`
+	PolicySummary security.PolicySummary `json:"policy_summary"`
 }
 
-func (e *Engine) StartSession(ctx context.Context, projectIdentifier string, rebuild bool) (*StartResult, error) {
-	cleanProj, err := pathsafe.CleanHostPath(projectIdentifier)
-	if err != nil {
-		return nil, fmt.Errorf("invalid project identifier: %w", err)
-	}
-
-	labDir := filepath.Join(e.cfg.LabRoot, cleanProj)
-	validatedLabDir, err := pathsafe.ValidateHostPathUnderRoot(labDir, e.cfg.LabRoot)
-	if err != nil {
-		return nil, fmt.Errorf("project path unsafe: %w", err)
-	}
-
-	mfs, err := manifest.LoadManifest(validatedLabDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load lab manifest: %w", err)
-	}
-
-	sess, err := e.sessMgr.CreateSession(mfs)
+func (e *Engine) StartSession(ctx context.Context, outboundNetwork, hostAccess bool, ttlMinutes int) (*StartResult, error) {
+	sess, err := e.sessMgr.CreateSession(session.ModePersistent, ttlMinutes)
 	if err != nil {
 		return nil, err
 	}
 
 	_ = e.sessMgr.Transition(sess.ID, session.StateCreated, session.StateStarting)
 
-	composeContent, err := docker.GenerateComposeYAML(sess.ID, mfs, e.cfg, validatedLabDir)
+	composeContent, err := docker.GenerateComposeYAML(sess.ID, e.cfg)
 	if err != nil {
 		_ = e.sessMgr.RemoveSession(sess.ID)
 		return nil, fmt.Errorf("failed to generate compose yaml: %w", err)
@@ -134,40 +188,30 @@ func (e *Engine) StartSession(ctx context.Context, projectIdentifier string, reb
 	}
 
 	if err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
-		if e.cfg.Security.RemoveSessionOnStartFailure {
-			_ = e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath)
-			_ = e.sessMgr.RemoveSession(sess.ID)
-		} else {
-			_ = e.sessMgr.Transition(sess.ID, session.StateStarting, session.StateFailed)
-		}
+		_ = e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath)
+		_ = e.sessMgr.RemoveSession(sess.ID)
 		return nil, fmt.Errorf("docker compose up failed: %w", err)
 	}
 
-	_ = e.sessMgr.Transition(sess.ID, session.StateStarting, session.StateHealthy)
-
-	internalURLs := make(map[string]string)
-	for _, target := range mfs.Targets {
-		if target.InternalPort > 0 {
-			internalURLs[target.Name] = fmt.Sprintf("http://%s:%d", target.Name, target.InternalPort)
-		}
-	}
+	_ = e.sessMgr.Transition(sess.ID, session.StateStarting, session.StateReady)
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
 			SessionID:     sess.ID,
-			Project:       mfs.Name,
 			Interface:     "engine",
-			ToolOrCommand: "lab_start",
+			ToolOrCommand: "sandbox_start",
 			Resources:     []string{sess.ComposeProject},
 		})
 	}
 
 	return &StartResult{
-		SessionID:    sess.ID,
-		Project:      mfs.Name,
-		InternalURLs: internalURLs,
-		Status:       string(session.StateHealthy),
-		ExpiresAt:    sess.ExpiresAt,
+		SessionID:     sess.ID,
+		Status:        string(session.StateReady),
+		CreatedAt:     sess.CreatedAt,
+		ExpiresAt:     sess.ExpiresAt,
+		Network:       e.cfg.Network,
+		HostGateway:   e.cfg.Network.HostGatewayName,
+		PolicySummary: security.GetPolicySummary(e.cfg),
 	}, nil
 }
 
@@ -188,14 +232,14 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 		return nil, err
 	}
 
-	if sess.Status != session.StateHealthy && sess.Status != session.StateRunningCommand {
+	if sess.Status != session.StateReady && sess.Status != session.StateRunningCommand {
 		return nil, fmt.Errorf("session %s is in state '%s', cannot execute command", sessID, sess.Status)
 	}
 
 	if cwd == "" {
-		cwd = "/workspace"
+		cwd = "/scratch"
 	}
-	cleanCwd, err := pathsafe.ValidateContainerPathUnderAllowed(cwd, []string{"/workspace", "/scratch", "/tmp"})
+	cleanCwd, err := pathsafe.ValidateContainerPathUnderAllowed(cwd, []string{"/scratch", "/tmp"})
 	if err != nil {
 		return nil, fmt.Errorf("invalid execution working directory: %w", err)
 	}
@@ -207,13 +251,12 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 	lock.Lock()
 	defer lock.Unlock()
 
+	_ = e.sessMgr.SetActiveExecCount(sessID, 1)
+	defer func() { _ = e.sessMgr.SetActiveExecCount(sessID, -1) }()
+
 	timeout := time.Duration(timeoutSec) * time.Second
 	if timeout <= 0 {
 		timeout = time.Duration(e.cfg.Limits.DefaultTimeoutSeconds) * time.Second
-	}
-	maxTimeout := time.Duration(e.cfg.Limits.MaximumTimeoutSeconds) * time.Second
-	if timeout > maxTimeout {
-		timeout = maxTimeout
 	}
 
 	start := time.Now()
@@ -232,9 +275,8 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
 			SessionID:       sessID,
-			Project:         sess.Project,
 			Interface:       "engine",
-			ToolOrCommand:   "lab_exec",
+			ToolOrCommand:   "sandbox_exec",
 			DurationMS:      duration,
 			ExitCode:        &exitCode,
 			TimedOut:        timedOut,
@@ -259,6 +301,177 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 	}, nil
 }
 
+type HTTPRequestOptions struct {
+	SessionID       string            `json:"session_id,omitempty"`
+	Method          string            `json:"method"`
+	URL             string            `json:"url"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Body            string            `json:"body,omitempty"`
+	FollowRedirects bool              `json:"follow_redirects"`
+	InsecureTLS     bool              `json:"insecure_tls"`
+	TimeoutSeconds  int               `json:"timeout_seconds"`
+	SaveCookiesPath string            `json:"save_cookies_path,omitempty"`
+	LoadCookiesPath string            `json:"load_cookies_path,omitempty"`
+}
+
+type HTTPRequestResult struct {
+	RequestedURL           string            `json:"requested_url"`
+	ConnectionHost         string            `json:"connection_host"`
+	HostGatewayTranslation bool              `json:"host_gateway_translation"`
+	StatusCode             int               `json:"status_code"`
+	Headers                map[string]string `json:"headers"`
+	Body                   string            `json:"body"`
+	DurationMS             int64             `json:"duration_ms"`
+	CurlExitCode           int               `json:"curl_exit_code"`
+	Truncated              bool              `json:"truncated"`
+}
+
+func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTTPRequestResult, error) {
+	if opts.URL == "" {
+		return nil, fmt.Errorf("URL cannot be empty")
+	}
+
+	parsedURL, err := url.Parse(opts.URL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return nil, fmt.Errorf("invalid URL scheme (must be http or https): %s", opts.URL)
+	}
+
+	method := strings.ToUpper(opts.Method)
+	if method == "" {
+		method = "GET"
+	}
+
+	hostname := parsedURL.Hostname()
+	port := parsedURL.Port()
+	if port == "" {
+		if parsedURL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	isLoopback := hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+	connectionHost := hostname
+	gatewayTranslation := false
+
+	var curlConnectTo string
+	if isLoopback {
+		connectionHost = e.cfg.Network.HostGatewayName
+		if connectionHost == "" {
+			connectionHost = "host.docker.internal"
+		}
+		gatewayTranslation = true
+		curlConnectTo = fmt.Sprintf("%s:%s:%s:%s", hostname, port, connectionHost, port)
+	}
+
+	// Build curl command array
+	var curlArgs []string
+	curlArgs = append(curlArgs, "curl", "-s", "-i", "-X", method)
+
+	if opts.FollowRedirects {
+		curlArgs = append(curlArgs, "-L")
+	}
+	if opts.InsecureTLS {
+		curlArgs = append(curlArgs, "-k")
+	}
+	if curlConnectTo != "" {
+		curlArgs = append(curlArgs, "--connect-to", curlConnectTo)
+	}
+
+	// Header validation and arguments
+	for k, v := range opts.Headers {
+		if strings.ContainsAny(k, "\r\n:") {
+			return nil, fmt.Errorf("%w: invalid header name '%s'", ErrInvalidHeaderName, k)
+		}
+		curlArgs = append(curlArgs, "-H", fmt.Sprintf("%s: %s", k, v))
+	}
+
+	if opts.LoadCookiesPath != "" {
+		cleanCookiePath, err := pathsafe.ValidateContainerPathUnderAllowed(opts.LoadCookiesPath, []string{"/scratch"})
+		if err == nil {
+			curlArgs = append(curlArgs, "-b", cleanCookiePath)
+		}
+	}
+	if opts.SaveCookiesPath != "" {
+		cleanCookiePath, err := pathsafe.ValidateContainerPathUnderAllowed(opts.SaveCookiesPath, []string{"/scratch"})
+		if err == nil {
+			curlArgs = append(curlArgs, "-c", cleanCookiePath)
+		}
+	}
+
+	if opts.Body != "" {
+		curlArgs = append(curlArgs, "-d", opts.Body)
+	}
+
+	curlArgs = append(curlArgs, fmt.Sprintf("%q", opts.URL))
+
+	fullCurlCmd := strings.Join(curlArgs, " ")
+
+	var execRes *ExecResult
+	if opts.SessionID != "" {
+		execRes, err = e.Exec(ctx, opts.SessionID, fullCurlCmd, "/scratch", opts.TimeoutSeconds, nil)
+	} else {
+		runRes, err := e.Run(ctx, fullCurlCmd, "/scratch", opts.TimeoutSeconds, nil)
+		if err == nil {
+			execRes = &ExecResult{
+				SessionID:       runRes.SessionID,
+				ExitCode:        runRes.ExitCode,
+				TimedOut:        runRes.TimedOut,
+				DurationMS:      runRes.DurationMS,
+				Stdout:          runRes.Stdout,
+				Stderr:          runRes.Stderr,
+				StdoutTruncated: runRes.StdoutTruncated,
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse HTTP status & response headers from curl -i output
+	statusCode := 0
+	resHeaders := make(map[string]string)
+	bodyStr := execRes.Stdout
+
+	parts := strings.SplitN(execRes.Stdout, "\r\n\r\n", 2)
+	if len(parts) < 2 {
+		parts = strings.SplitN(execRes.Stdout, "\n\n", 2)
+	}
+
+	if len(parts) >= 2 {
+		headerLines := strings.Split(parts[0], "\n")
+		if len(headerLines) > 0 {
+			headerFields := strings.Fields(headerLines[0])
+			if len(headerFields) >= 2 {
+				statusCode, _ = strconv.Atoi(headerFields[1])
+			}
+		}
+		for _, line := range headerLines[1:] {
+			kv := strings.SplitN(line, ":", 2)
+			if len(kv) == 2 {
+				resHeaders[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+			}
+		}
+		bodyStr = parts[1]
+	}
+
+	return &HTTPRequestResult{
+		RequestedURL:           opts.URL,
+		ConnectionHost:         connectionHost,
+		HostGatewayTranslation: gatewayTranslation,
+		StatusCode:             statusCode,
+		Headers:                resHeaders,
+		Body:                   bodyStr,
+		DurationMS:             execRes.DurationMS,
+		CurlExitCode:           execRes.ExitCode,
+		Truncated:              execRes.StdoutTruncated,
+	}, nil
+}
+
 type ReadResult struct {
 	SessionID string `json:"session_id"`
 	Path      string `json:"path"`
@@ -267,49 +480,35 @@ type ReadResult struct {
 	Truncated bool   `json:"truncated"`
 }
 
-func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, offset int64, maxBytes int64) (*ReadResult, error) {
-	cleanPath, err := pathsafe.ValidateContainerPathUnderAllowed(containerPath, []string{"/workspace", "/scratch"})
+func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, offset int64, maxBytes int64, binaryEncoding string) (*ReadResult, error) {
+	cleanPath, err := pathsafe.ValidateContainerPathUnderAllowed(containerPath, []string{"/scratch"})
 	if err != nil {
-		return nil, fmt.Errorf("read path denied: %w", err)
-	}
-
-	sess, err := e.sessMgr.GetSession(sessID)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidScratchPath, err)
 	}
 
 	if maxBytes <= 0 {
 		maxBytes = e.cfg.Limits.MaximumReadBytes
 	}
 
-	// Read via base64 encoded cat in runner container
-	cmd := fmt.Sprintf("base64 -w 0 '%s'", cleanPath)
-	res, err := e.Exec(ctx, sess.ID, cmd, "/workspace", 15, nil)
+	cmd := fmt.Sprintf("/usr/local/bin/sandbox-fs read '%s' %d %d", cleanPath, offset, maxBytes)
+	res, err := e.Exec(ctx, sessID, cmd, "/scratch", 15, nil)
 	if err != nil || res.ExitCode != 0 {
-		return nil, fmt.Errorf("failed to read container file '%s': exit code %d, stderr: %s", cleanPath, res.ExitCode, res.Stderr)
+		return nil, fmt.Errorf("sandbox-fs read failed for '%s': exit code %d, stderr: %s", cleanPath, res.ExitCode, res.Stderr)
 	}
 
-	rawBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(res.Stdout))
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode container file content: %w", err)
-	}
-
-	if offset > 0 && offset < int64(len(rawBytes)) {
-		rawBytes = rawBytes[offset:]
-	}
-
-	truncated := false
-	if int64(len(rawBytes)) > maxBytes {
-		rawBytes = rawBytes[:maxBytes]
-		truncated = true
+	content := res.Stdout
+	encoding := "utf-8"
+	if binaryEncoding == "base64" {
+		content = base64.StdEncoding.EncodeToString([]byte(res.Stdout))
+		encoding = "base64"
 	}
 
 	return &ReadResult{
 		SessionID: sessID,
 		Path:      cleanPath,
-		Content:   string(rawBytes),
-		Encoding:  "utf-8",
-		Truncated: truncated,
+		Content:   content,
+		Encoding:  encoding,
+		Truncated: res.StdoutTruncated,
 	}, nil
 }
 
@@ -319,20 +518,10 @@ type WriteResult struct {
 	BytesWritten   int64  `json:"bytes_written"`
 }
 
-// Invariant 5: Scratch is the only persistent writable agent directory.
-func (e *Engine) WriteScratch(ctx context.Context, sessID, scratchPath, content, encoding string, overwrite bool) (*WriteResult, error) {
+func (e *Engine) WriteFile(ctx context.Context, sessID, scratchPath, content, encoding string, overwrite bool) (*WriteResult, error) {
 	cleanPath, err := pathsafe.ValidateContainerPathUnderAllowed(scratchPath, []string{"/scratch"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidScratchPath, err)
-	}
-
-	if cleanPath == "/scratch" || cleanPath == "/scratch/" {
-		return nil, fmt.Errorf("%w: cannot write directly to root /scratch as a file", ErrInvalidScratchPath)
-	}
-
-	sess, err := e.sessMgr.GetSession(sessID)
-	if err != nil {
-		return nil, err
 	}
 
 	if int64(len(content)) > e.cfg.Limits.MaximumWriteBytes {
@@ -340,21 +529,18 @@ func (e *Engine) WriteScratch(ctx context.Context, sessID, scratchPath, content,
 	}
 
 	b64Data := base64.StdEncoding.EncodeToString([]byte(content))
-	dir := path.Dir(cleanPath)
-
-	var cmd string
+	overwriteStr := "false"
 	if overwrite {
-		cmd = fmt.Sprintf("mkdir -p '%s' && echo '%s' | base64 -d > '%s'", dir, b64Data, cleanPath)
-	} else {
-		cmd = fmt.Sprintf("mkdir -p '%s' && if [ -f '%s' ]; then exit 17; else echo '%s' | base64 -d > '%s'; fi", dir, cleanPath, b64Data, cleanPath)
+		overwriteStr = "true"
 	}
 
-	res, err := e.Exec(ctx, sess.ID, cmd, "/scratch", 15, nil)
+	cmd := fmt.Sprintf("echo '%s' | base64 -d | /usr/local/bin/sandbox-fs write '%s' %s", b64Data, cleanPath, overwriteStr)
+	res, err := e.Exec(ctx, sessID, cmd, "/scratch", 15, nil)
 	if err != nil || res.ExitCode != 0 {
 		if res != nil && res.ExitCode == 17 {
 			return nil, fmt.Errorf("file '%s' already exists and overwrite is false", cleanPath)
 		}
-		return nil, fmt.Errorf("failed to write file '%s' in scratch: %s", cleanPath, res.Stderr)
+		return nil, fmt.Errorf("sandbox-fs write failed for '%s': %s", cleanPath, res.Stderr)
 	}
 
 	return &WriteResult{
@@ -364,16 +550,53 @@ func (e *Engine) WriteScratch(ctx context.Context, sessID, scratchPath, content,
 	}, nil
 }
 
-type ExportResult struct {
-	SessionID   string `json:"session_id"`
-	SourcePath  string `json:"source_path"`
-	ExportPath  string `json:"export_path"`
-	SHA256Check string `json:"sha256"`
-	Bytes       int64  `json:"bytes"`
+type PublicStatus struct {
+	SessionID       string                `json:"session_id"`
+	Mode            string                `json:"mode"`
+	Status          string                `json:"status"`
+	CreatedAt       time.Time             `json:"created_at"`
+	ExpiresAt       time.Time             `json:"expires_at"`
+	ActiveExecCount int                   `json:"active_exec_count"`
+	NetworkPolicy   config.NetworkConfig  `json:"network_policy"`
+	SecurityPolicy  config.SecurityConfig `json:"security_policy"`
 }
 
-// Invariant 8: Export is disabled by default.
-func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName string) (*ExportResult, error) {
+func (e *Engine) Status(sessID string) (interface{}, error) {
+	if sessID != "" {
+		s, err := e.sessMgr.GetSession(sessID)
+		if err != nil {
+			return nil, err
+		}
+		return PublicStatus{
+			SessionID:       s.ID,
+			Mode:            string(s.Mode),
+			Status:          string(s.Status),
+			CreatedAt:       s.CreatedAt,
+			ExpiresAt:       s.ExpiresAt,
+			ActiveExecCount: s.ActiveExecCount,
+			NetworkPolicy:   s.NetworkPolicy,
+			SecurityPolicy:  s.SecurityPolicy,
+		}, nil
+	}
+
+	sessions := e.sessMgr.ListSessions()
+	var publicList []PublicStatus
+	for _, s := range sessions {
+		publicList = append(publicList, PublicStatus{
+			SessionID:       s.ID,
+			Mode:            string(s.Mode),
+			Status:          string(s.Status),
+			CreatedAt:       s.CreatedAt,
+			ExpiresAt:       s.ExpiresAt,
+			ActiveExecCount: s.ActiveExecCount,
+			NetworkPolicy:   s.NetworkPolicy,
+			SecurityPolicy:  s.SecurityPolicy,
+		})
+	}
+	return publicList, nil
+}
+
+func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName string) (interface{}, error) {
 	if !e.cfg.Security.AllowExport {
 		return nil, ErrExportDisabled
 	}
@@ -410,30 +633,15 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 		return nil, fmt.Errorf("failed to read exported file for hashing: %w", err)
 	}
 
-	if int64(len(data)) > e.cfg.Limits.MaximumExportBytes {
-		_ = os.Remove(cleanDest)
-		return nil, fmt.Errorf("exported file exceeds size limit %d", e.cfg.Limits.MaximumExportBytes)
-	}
-
 	hash := sha256.Sum256(data)
 	shaHex := hex.EncodeToString(hash[:])
 
-	if e.auditLogger != nil {
-		_ = e.auditLogger.Log(audit.Event{
-			SessionID:     sessID,
-			Project:       sess.Project,
-			Interface:     "engine",
-			ToolOrCommand: "lab_export_file",
-			Resources:     []string{cleanDest},
-		})
-	}
-
-	return &ExportResult{
-		SessionID:   sessID,
-		SourcePath:  cleanScratch,
-		ExportPath:  cleanDest,
-		SHA256Check: shaHex,
-		Bytes:       int64(len(data)),
+	return map[string]interface{}{
+		"session_id":  sessID,
+		"source_path": cleanScratch,
+		"export_path": cleanDest,
+		"sha256":      shaHex,
+		"bytes":       int64(len(data)),
 	}, nil
 }
 
@@ -443,38 +651,37 @@ func (e *Engine) StopSession(ctx context.Context, sessID string) error {
 		return err
 	}
 
+	// Verify resource ownership before destructive removal
+	_ = e.dockerClient.VerifyResourceOwnership(ctx, sess.ComposeProject, sess.ID)
+
 	_ = e.sessMgr.Transition(sessID, "", session.StateStopping)
-	_ = e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath)
+	if err := e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
+		sess.CleanupState = "cleanup-failed"
+		_ = e.sessMgr.Transition(sessID, "", session.StateCleanupFailed)
+		return fmt.Errorf("failed to stop session containers: %w", err)
+	}
+
 	_ = e.sessMgr.RemoveSession(sessID)
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
 			SessionID:     sessID,
-			Project:       sess.Project,
 			Interface:     "engine",
-			ToolOrCommand: "lab_stop",
+			ToolOrCommand: "sandbox_stop",
 		})
 	}
 
 	return nil
 }
 
-func (e *Engine) ResetSession(ctx context.Context, sessID string, rebuild bool) (*StartResult, error) {
-	sess, err := e.sessMgr.GetSession(sessID)
-	if err != nil {
-		return nil, err
-	}
-
-	proj := sess.Project
+func (e *Engine) ResetSession(ctx context.Context, sessID string) (*StartResult, error) {
 	_ = e.StopSession(ctx, sessID)
-
-	return e.StartSession(ctx, proj, rebuild)
+	return e.StartSession(ctx, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled, e.cfg.Limits.DefaultSessionTTLMinutes)
 }
 
-func (e *Engine) GetSessionStatus(sessID string) (*session.Session, error) {
-	return e.sessMgr.GetSession(sessID)
-}
-
-func (e *Engine) ListSessions() []*session.Session {
-	return e.sessMgr.ListSessions()
+func (e *Engine) GetAuditSummary(sessionID string, limit int) ([]audit.Event, error) {
+	if e.auditLogger == nil {
+		return []audit.Event{}, nil
+	}
+	return e.auditLogger.GetSummaryForSession(sessionID, limit)
 }

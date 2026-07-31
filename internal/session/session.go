@@ -11,9 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/config"
-	"github.com/ai-security-lab-runner/lab-runner/internal/manifest"
-	"github.com/ai-security-lab-runner/lab-runner/internal/pathsafe"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/config"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/pathsafe"
 )
 
 var (
@@ -23,31 +22,41 @@ var (
 	ErrConcurrentExecLimit    = errors.New("concurrent command execution limit reached for session")
 )
 
+type Mode string
+
+const (
+	ModePersistent Mode = "persistent"
+	ModeEphemeral  Mode = "ephemeral"
+)
+
 type State string
 
 const (
 	StateCreated        State = "created"
 	StateStarting       State = "starting"
-	StateHealthy        State = "healthy"
+	StateReady          State = "ready"
 	StateRunningCommand State = "running-command"
 	StateStopping       State = "stopping"
 	StateStopped        State = "stopped"
 	StateFailed         State = "failed"
+	StateCleanupFailed  State = "cleanup-failed"
 	StateExpired        State = "expired"
 )
 
 type Session struct {
-	ID              string                `json:"session_id"`
-	Project         string                `json:"project"`
-	LabDir          string                `json:"lab_dir"`
-	ComposeProject  string                `json:"compose_project"`
-	ComposeFilePath string                `json:"compose_file_path"`
-	CreatedAt       time.Time             `json:"created_at"`
-	ExpiresAt       time.Time             `json:"expires_at"`
-	Status          State                 `json:"status"`
-	Manifest        *manifest.LabManifest `json:"manifest"`
-	PreserveScratch bool                  `json:"preserve_scratch"`
-	ActiveExecCount int                   `json:"active_exec_count"`
+	ID                string                `json:"session_id"`
+	Mode              Mode                  `json:"mode"`
+	ComposeProject    string                `json:"compose_project"`
+	ComposeFilePath   string                `json:"compose_file_path"`
+	CreatedAt         time.Time             `json:"created_at"`
+	ExpiresAt         time.Time             `json:"expires_at"`
+	Status            State                 `json:"status"`
+	RunnerContainerID string                `json:"runner_container_id,omitempty"`
+	ScratchVolumeName string                `json:"scratch_volume_name"`
+	ActiveExecCount   int                   `json:"active_exec_count"`
+	CleanupState      string                `json:"cleanup_state"`
+	NetworkPolicy     config.NetworkConfig  `json:"network_policy"`
+	SecurityPolicy    config.SecurityConfig `json:"security_policy"`
 }
 
 type Manager struct {
@@ -58,7 +67,6 @@ type Manager struct {
 	execLocks map[string]*sync.Mutex
 }
 
-// Invariant 12: Session identifiers are unpredictable (crypto/rand).
 func GenerateSessionID() (string, error) {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
@@ -88,13 +96,13 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	return m, nil
 }
 
-func (m *Manager) CreateSession(mfs *manifest.LabManifest) (*Session, error) {
+func (m *Manager) CreateSession(mode Mode, ttlMinutes int) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	activeCount := 0
 	for _, s := range m.sessions {
-		if s.Status == StateStarting || s.Status == StateHealthy || s.Status == StateRunningCommand {
+		if s.Status == StateStarting || s.Status == StateReady || s.Status == StateRunningCommand {
 			activeCount++
 		}
 	}
@@ -109,10 +117,13 @@ func (m *Manager) CreateSession(mfs *manifest.LabManifest) (*Session, error) {
 	}
 
 	now := time.Now().UTC()
-	ttl := time.Duration(m.cfg.Limits.SessionTTLMinutes) * time.Minute
-	if ttl <= 0 {
-		ttl = 120 * time.Minute
+	if ttlMinutes <= 0 {
+		ttlMinutes = m.cfg.Limits.DefaultSessionTTLMinutes
 	}
+	if ttlMinutes > m.cfg.Limits.MaximumSessionTTLMinutes {
+		ttlMinutes = m.cfg.Limits.MaximumSessionTTLMinutes
+	}
+	ttl := time.Duration(ttlMinutes) * time.Minute
 
 	sessDir := filepath.Join(m.stateDir, id)
 	if err := os.MkdirAll(sessDir, 0700); err != nil {
@@ -120,19 +131,21 @@ func (m *Manager) CreateSession(mfs *manifest.LabManifest) (*Session, error) {
 	}
 
 	composeFile := filepath.Join(sessDir, "docker-compose.yaml")
-	composeProject := fmt.Sprintf("labrunner_%s", id[:8])
+	composeProject := fmt.Sprintf("sandbox_%s", id[:8])
+	scratchVolName := fmt.Sprintf("sandbox-scratch-%s", id)
 
 	s := &Session{
-		ID:              id,
-		Project:         mfs.Name,
-		LabDir:          mfs.Dir,
-		ComposeProject:  composeProject,
-		ComposeFilePath: composeFile,
-		CreatedAt:       now,
-		ExpiresAt:       now.Add(ttl),
-		Status:          StateCreated,
-		Manifest:        mfs,
-		PreserveScratch: mfs.Runner.ScratchPersistent,
+		ID:                id,
+		Mode:              mode,
+		ComposeProject:    composeProject,
+		ComposeFilePath:   composeFile,
+		CreatedAt:         now,
+		ExpiresAt:         now.Add(ttl),
+		Status:            StateCreated,
+		ScratchVolumeName: scratchVolName,
+		CleanupState:      "none",
+		NetworkPolicy:     m.cfg.Network,
+		SecurityPolicy:    m.cfg.Security,
 	}
 
 	m.sessions[id] = s
@@ -156,7 +169,7 @@ func (m *Manager) GetSession(id string) (*Session, error) {
 		return nil, fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
 	}
 
-	if time.Now().UTC().After(s.ExpiresAt) && (s.Status == StateHealthy || s.Status == StateCreated) {
+	if time.Now().UTC().After(s.ExpiresAt) && (s.Status == StateReady || s.Status == StateCreated) {
 		s.Status = StateExpired
 		_ = m.saveSessionLocked(s)
 	}
@@ -171,7 +184,7 @@ func (m *Manager) ListSessions() []*Session {
 	list := make([]*Session, 0, len(m.sessions))
 	now := time.Now().UTC()
 	for _, s := range m.sessions {
-		if now.After(s.ExpiresAt) && (s.Status == StateHealthy || s.Status == StateCreated) {
+		if now.After(s.ExpiresAt) && (s.Status == StateReady || s.Status == StateCreated) {
 			s.Status = StateExpired
 			_ = m.saveSessionLocked(s)
 		}
@@ -194,6 +207,22 @@ func (m *Manager) Transition(id string, from, to State) error {
 	}
 
 	s.Status = to
+	return m.saveSessionLocked(s)
+}
+
+func (m *Manager) SetActiveExecCount(id string, delta int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[id]
+	if !ok {
+		return fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
+	}
+
+	s.ActiveExecCount += delta
+	if s.ActiveExecCount < 0 {
+		s.ActiveExecCount = 0
+	}
 	return m.saveSessionLocked(s)
 }
 

@@ -1,57 +1,48 @@
 # MCP Integration Guide
 
-`lab-runner` implements Model Context Protocol (MCP) over stdio. It works with any client supporting standard stdio MCP servers (Claude Desktop, IDE extensions, CLI agents, custom MCP clients).
+## Standard I/O MCP Configuration
 
-## Generic Client Registration
-
-### Windows Example
-
+### Windows
 ```json
 {
   "mcpServers": {
-    "security-lab-runner": {
-      "command": "C:\\Tools\\Lab-Runner\\lab-runner.exe",
-      "args": [
-        "serve",
-        "--config",
-        "C:\\Tools\\Lab-Runner\\config.yaml"
-      ]
+    "ai-security-sandbox": {
+      "command": "D:\\Tools\\Lab-Runner\\lab-runner.exe",
+      "args": ["serve"],
+      "env": {
+        "LAB_RUNNER_STATE_DIR": "C:\\Users\\ExampleUser\\.ai-security-lab-runner"
+      }
     }
   }
 }
 ```
 
-### Linux / macOS Example
-
+### Linux / macOS
 ```json
 {
   "mcpServers": {
-    "security-lab-runner": {
-      "command": "/opt/ai-security-lab-runner/lab-runner",
-      "args": [
-        "serve",
-        "--config",
-        "/etc/ai-security-lab-runner/config.yaml"
-      ]
+    "ai-security-sandbox": {
+      "command": "/usr/local/bin/lab-runner",
+      "args": ["serve"],
+      "env": {
+        "LAB_RUNNER_STATE_DIR": "/home/user/.ai-security-lab-runner"
+      }
     }
   }
 }
 ```
 
-## Available MCP Tools
+---
 
-All tools are prefixed with `lab_`:
-- `lab_list_projects`
-- `lab_start`
-- `lab_exec`
-- `lab_read_file`
-- `lab_write_scratch`
-- `lab_status`
-- `lab_export_file`
-- `lab_reset`
-- `lab_stop`
-- `lab_get_audit_summary`
+## Exposed MCP Tools (`sandbox_*`)
 
-## Stdio Protocol Guarantee
-
-Standard output (`stdout`) is reserved strictly for JSON-RPC MCP messages. All diagnostic logs and error details are printed to `stderr`.
+- `sandbox_run`
+- `sandbox_start`
+- `sandbox_exec`
+- `sandbox_http_request`
+- `sandbox_write_file`
+- `sandbox_read_file`
+- `sandbox_status`
+- `sandbox_stop`
+- `sandbox_reset`
+- `sandbox_get_audit_summary`

@@ -1,19 +1,25 @@
-# Windows 11 Setup Guide
+# Windows Setup Guide
 
 ## Requirements
-- Windows 11 Home/Pro/Enterprise
-- Docker Desktop with WSL2 backend (Linux containers active)
+- Windows 11 (64-bit)
+- Docker Desktop with Linux containers backend enabled
 - Go 1.24+ (for building from source)
 
-## Installation & Setup
+## Setup Steps
 
-1. Open PowerShell in repository root `D:\Tools\Lab-Runner`.
-2. Build the runner binary and Docker image:
+1. Clone the repository:
    ```powershell
-   .\scripts\build.ps1
+   git clone https://github.com/tobiasGuta/AI-Security-Lab-Runner-.git D:\Tools\Lab-Runner
+   cd D:\Tools\Lab-Runner
    ```
-3. Run diagnostic check:
+
+2. Build the binary & runner image:
+   ```powershell
+   go build -o lab-runner.exe ./cmd/lab-runner
+   docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/
+   ```
+
+3. Run doctor checks:
    ```powershell
    .\lab-runner.exe doctor
    ```
-4. Register `lab-runner.exe` with your MCP client using `configs/mcp-client-windows.example.json`.

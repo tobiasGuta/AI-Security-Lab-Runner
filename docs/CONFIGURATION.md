@@ -1,21 +1,23 @@
-# Host Configuration Guide
+# Configuration Guide (Version 2)
 
-`lab-runner` uses YAML for host configuration settings.
-
-## Configuration Schema (v1)
+## Schema Overview
 
 ```yaml
-version: 1
+version: 2
 
-lab_root: "D:\\Labs"
 state_dir: "C:\\Users\\ExampleUser\\.ai-security-lab-runner"
 audit_log: "C:\\Users\\ExampleUser\\.ai-security-lab-runner\\audit.jsonl"
-export_dir: "D:\\Labs\\Exports"
+export_dir: "C:\\Users\\ExampleUser\\.ai-security-lab-runner\\exports"
 
 runner:
   image: "ai-security-agent-runner:latest"
-  dockerfile: "D:\\Tools\\Lab-Runner\\runner\\Dockerfile"
+  dockerfile: "runner/Dockerfile"
   pull_policy: "never"
+
+network:
+  outbound_enabled: true
+  host_gateway_enabled: true
+  host_gateway_name: "host.docker.internal"
 
 limits:
   default_timeout_seconds: 30
@@ -25,19 +27,21 @@ limits:
   maximum_write_bytes: 1048576
   maximum_read_bytes: 2097152
   maximum_export_bytes: 5242880
-  session_ttl_minutes: 120
+  default_session_ttl_minutes: 60
+  maximum_session_ttl_minutes: 240
   maximum_sessions: 4
   maximum_parallel_exec_per_session: 1
   maximum_parallel_global_exec: 4
 
 security:
   allow_export: false
-  allow_host_port_publish: false
   preserve_scratch_on_stop: false
   remove_session_on_start_failure: true
-  require_internal_network: true
-  allow_internet_egress: false
   command_policy: "container-only"
+  allow_host_filesystem_mounts: false
+  allow_docker_socket: false
+  allow_privileged: false
+  allow_host_network: false
 
 logging:
   level: "info"
@@ -47,9 +51,9 @@ logging:
   redact_known_secret_patterns: true
 ```
 
-## Precedence Order
+---
 
-1. Built-in secure defaults.
-2. YAML configuration file.
-3. Environment variables (`LAB_RUNNER_...`).
-4. Explicit CLI flags.
+## Migration from Version 1
+
+Configuration version 1 (`lab_root`, target definitions) is obsolete. If loaded, `lab-runner` will return an error:
+`configuration version 1 is obsolete; please update configuration to version 2 (remove lab_root and add network settings)`

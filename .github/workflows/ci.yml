@@ -7,8 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    name: Build and Test
+  build-and-test:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,19 +19,28 @@ jobs:
         with:
           go-version: '1.24'
 
-      - name: Verify Formatting
+      - name: Verify Code Formatting (gofmt)
         run: |
           if [ -n "$(gofmt -l .)" ]; then
-            echo "The following files are not formatted:"
+            echo "The following files are not formatted with gofmt:"
             gofmt -l .
             exit 1
           fi
 
-      - name: Run Go Vet
+      - name: Go Vet
         run: go vet ./...
 
-      - name: Run Unit Tests
+      - name: Go Unit Tests
+        run: go test -v ./...
+
+      - name: Go Race Detector Tests
         run: go test -v -race ./...
 
-      - name: Build Executable
-        run: go build -v ./...
+      - name: Build Executable Binary
+        run: go build -o lab-runner ./cmd/lab-runner
+
+      - name: Build Runner Container Image
+        run: docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/
+
+      - name: Infrastructure Health Check (Doctor)
+        run: ./lab-runner doctor

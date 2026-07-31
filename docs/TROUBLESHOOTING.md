@@ -2,18 +2,20 @@
 
 ## Common Issues & Solutions
 
-### 1. `lab-runner doctor` reports Docker daemon unavailable
-- **Cause**: Docker Desktop or Docker Engine service is stopped.
-- **Fix**: Start Docker Desktop or execute `sudo systemctl start docker`.
+### 1. `configuration version 1 is obsolete`
+**Cause**: Using a legacy version 1 `config.yaml` containing `lab_root`.
+**Solution**: Remove `lab_root` and update schema to version 2 (see `configs/config.example.yaml`).
 
-### 2. Linux Containers check fails on Windows
-- **Cause**: Docker Desktop is set to Windows Containers mode.
-- **Fix**: Right-click Docker Desktop tray icon -> select "Switch to Linux containers...".
+### 2. `Docker is configured for 'windows' containers`
+**Cause**: Docker Desktop is set to Windows container mode.
+**Solution**: Right-click Docker Desktop system tray icon -> "Switch to Linux containers...".
 
-### 3. Read-only workspace error during agent command
-- **Cause**: Command attempted to modify files under `/workspace`.
-- **Fix**: Designate `/scratch` for writing temporary output or script files. `/workspace` is intentionally mounted read-only for host security.
+### 3. `host.docker.internal not resolving`
+**Cause**: Linux Docker Engine without host-gateway configured.
+**Solution**: Ensure `extra_hosts: ["host.docker.internal:host-gateway"]` is enabled in configuration version 2.
 
-### 4. MCP client fails to connect
-- **Cause**: Path escaping issues or non-protocol output on stdout.
-- **Fix**: Check `configs/mcp-client-windows.example.json` for proper backslash escaping (`C:\\Tools\\Lab-Runner\\lab-runner.exe`). Verify logs on `stderr`.
+### 4. Diagnostic Command
+Always run `lab-runner doctor` to verify system health:
+```powershell
+.\lab-runner.exe doctor
+```

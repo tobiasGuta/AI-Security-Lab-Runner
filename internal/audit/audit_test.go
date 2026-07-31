@@ -21,11 +21,11 @@ func TestAuditLogAndRedaction(t *testing.T) {
 		t.Fatalf("failed to create logger: %v", err)
 	}
 
-	rawCommand := "curl -H 'Authorization: Bearer secret-token-12345' http://target:3000/api"
+	rawCommand := "curl -H 'Authorization: Bearer secret-token-12345' https://example.com"
 	evt := Event{
 		SessionID:       "sess-123",
 		Interface:       "cli",
-		ToolOrCommand:   "exec",
+		ToolOrCommand:   "sandbox_exec",
 		RedactedCommand: rawCommand,
 	}
 
@@ -51,5 +51,11 @@ func TestAuditLogAndRedaction(t *testing.T) {
 
 	if readEvt.RedactedCommand == rawCommand {
 		t.Errorf("expected secret to be redacted in log, but got raw command: %s", readEvt.RedactedCommand)
+	}
+
+	// Verify session summary retrieval
+	summary, err := logger.GetSummaryForSession("sess-123", 10)
+	if err != nil || len(summary) != 1 {
+		t.Fatalf("GetSummaryForSession failed: len=%d err=%v", len(summary), err)
 	}
 }

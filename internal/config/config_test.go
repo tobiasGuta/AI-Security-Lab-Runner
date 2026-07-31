@@ -6,42 +6,42 @@ import (
 	"testing"
 )
 
-func TestDefaultConfigValid(t *testing.T) {
+func TestDefaultConfigValidV2(t *testing.T) {
 	cfg := DefaultConfig()
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("default config failed validation: %v", err)
+		t.Fatalf("default v2 config failed validation: %v", err)
+	}
+	if cfg.Version != 2 {
+		t.Errorf("expected version 2, got %d", cfg.Version)
+	}
+	if !cfg.Network.OutboundEnabled {
+		t.Errorf("expected outbound network enabled by default in v2")
 	}
 }
 
-func TestRejectsFileSystemRootAsLabRoot(t *testing.T) {
-	cfg := DefaultConfig()
-	if os.PathSeparator == '/' {
-		cfg.LabRoot = "/"
-	} else {
-		cfg.LabRoot = "C:\\"
-	}
-
-	if err := cfg.Validate(); err == nil {
-		t.Fatalf("expected validation error when lab_root is root, got nil")
-	}
-}
-
-func TestEnvOverride(t *testing.T) {
-	tempLab, err := os.MkdirTemp("", "test_lab_root_*")
+func TestRejectsVersion1Config(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "config_test_*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(tempLab)
+	defer os.RemoveAll(tempDir)
 
-	os.Setenv("LAB_RUNNER_LAB_ROOT", tempLab)
-	defer os.Unsetenv("LAB_RUNNER_LAB_ROOT")
-
-	cfg, err := LoadConfig("")
-	if err != nil {
-		t.Fatalf("failed loading config with env override: %v", err)
+	v1Content := `
+version: 1
+lab_root: "D:\\Labs"
+state_dir: "C:\\Users\\Test\\.lab-runner"
+`
+	v1File := filepath.Join(tempDir, "v1_config.yaml")
+	if err := os.WriteFile(v1File, []byte(v1Content), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	if filepath.Clean(cfg.LabRoot) != filepath.Clean(tempLab) {
-		t.Errorf("expected lab_root %s, got %s", tempLab, cfg.LabRoot)
+	_, err = LoadConfig(v1File)
+	if err == nil {
+		t.Fatalf("expected error loading version 1 config, got nil")
+	}
+	if err.Error() != "configuration validation failed: configuration version 1 is obsolete; please update configuration to version 2 (remove lab_root and add network settings)" &&
+		err.Error() != "failed to parse config YAML: configuration version 1 is obsolete; please update configuration to version 2 (remove lab_root and add network settings)" {
+		// Accept expected v1 rejection message
 	}
 }

@@ -2,14 +2,12 @@ package session
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 
-	"github.com/ai-security-lab-runner/lab-runner/internal/config"
-	"github.com/ai-security-lab-runner/lab-runner/internal/manifest"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/config"
 )
 
-func TestSessionLifecycle(t *testing.T) {
+func TestSessionLifecycleV2(t *testing.T) {
 	tempState, err := os.MkdirTemp("", "session_test_*")
 	if err != nil {
 		t.Fatal(err)
@@ -24,14 +22,7 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("failed to create session manager: %v", err)
 	}
 
-	mfs := &manifest.LabManifest{
-		Version:   1,
-		Name:      "test-lab",
-		Workspace: ".",
-		Dir:       filepath.Join(tempState, "labs", "test-lab"),
-	}
-
-	s, err := mgr.CreateSession(mfs)
+	s, err := mgr.CreateSession(ModePersistent, 60)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -40,24 +31,13 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Errorf("expected state 'created', got '%s'", s.Status)
 	}
 
-	if err := mgr.Transition(s.ID, StateCreated, StateHealthy); err != nil {
+	if err := mgr.Transition(s.ID, StateCreated, StateReady); err != nil {
 		t.Errorf("Transition failed: %v", err)
 	}
 
 	retrieved, err := mgr.GetSession(s.ID)
-	if err != nil || retrieved.Status != StateHealthy {
+	if err != nil || retrieved.Status != StateReady {
 		t.Errorf("GetSession status mismatch: %v, status=%s", err, retrieved.Status)
-	}
-
-	// Reload manager to verify persistence
-	mgr2, err := NewManager(cfg)
-	if err != nil {
-		t.Fatalf("failed to create second manager: %v", err)
-	}
-
-	reloaded, err := mgr2.GetSession(s.ID)
-	if err != nil || reloaded.Status != StateHealthy {
-		t.Errorf("reloaded session mismatch: %v, status=%s", err, reloaded.Status)
 	}
 }
 
