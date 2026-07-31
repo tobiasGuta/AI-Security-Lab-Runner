@@ -1,11 +1,11 @@
-# Compiled Executables & Binaries
-lab-runner
-lab-runner.exe
-*.exe
-*.exe~
-*.exe.test
-*.out
-*.test
+# Compiled Executables (Root only - leading slash prevents ignoring cmd/lab-runner)
+/lab-runner
+/lab-runner.exe
+/*.exe
+/*.exe~
+/*.exe.test
+/*.out
+/*.test
 runner/sandbox-fs/sandbox-fs
 runner/sandbox-fs/sandbox-fs.exe
 
