@@ -13,11 +13,12 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/runner/internal/scratchfs"
 )
 
 var (
@@ -48,7 +49,7 @@ type ResponseDoc struct {
 	BodyBase64             bool                `json:"body_base64"`
 	DurationMS             int64               `json:"duration_ms"`
 	RedirectChain          []string            `json:"redirect_chain"`
-	ExitCode               int                 `json:"curl_exit_code"` // Kept JSON tag for backwards compatibility
+	ExitCode               int                 `json:"curl_exit_code"` // Kept JSON tag for backward compatibility
 	ErrorCategory          string              `json:"error_category,omitempty"`
 	HostGatewayTranslation bool                `json:"host_gateway_translation"`
 	ConnectionHost         string              `json:"connection_host"`
@@ -95,7 +96,6 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 		return nil, fmt.Errorf("invalid HTTP method token: %s", method)
 	}
 
-	// Validate header count and CRLF injection
 	if len(spec.Headers) > 100 {
 		return nil, fmt.Errorf("exceeded maximum header count limit (100)")
 	}
@@ -112,21 +112,27 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 		}
 	}
 
-	// Validate request body limit (max 1MB)
 	if len(spec.Body) > 1048576 {
 		return nil, fmt.Errorf("request body size %d exceeds limit 1MB", len(spec.Body))
 	}
 
-	// Jar setup
+	// Jar setup via descriptor-relative scratchfs
 	jar, _ := cookiejar.New(nil)
 	if spec.LoadCookiesPath != "" {
-		if err := loadCookies(jar, spec.LoadCookiesPath, parsedURL); err != nil {
+		cookieData, err := scratchfs.LoadCookieFileSecure(spec.LoadCookiesPath)
+		if err != nil {
 			return &ResponseDoc{
 				RequestedURL:  spec.URL,
 				ErrorCategory: "COOKIE_READ_FAILURE",
 				ExitCode:      1,
 				Body:          fmt.Sprintf("Failed to load cookies from '%s': %v", spec.LoadCookiesPath, err),
 			}, nil
+		}
+		if len(cookieData) > 0 {
+			var cookies []*http.Cookie
+			if err := json.Unmarshal(cookieData, &cookies); err == nil {
+				jar.SetCookies(parsedURL, cookies)
+			}
 		}
 	}
 
@@ -147,7 +153,7 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: spec.InsecureTLS,
-			ServerName:         parsedURL.Hostname(), // Preserve SNI
+			// ServerName is deliberately left UNSET so Go's standard client dynamically derives TLS SNI from each request URL during redirects!
 		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, splitErr := net.SplitHostPort(addr)
@@ -183,7 +189,6 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 		},
 	}
 
-	// Preserve URL intact (no URL rewriting!)
 	req, err := http.NewRequest(method, spec.URL, bytes.NewReader([]byte(spec.Body)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
@@ -247,7 +252,18 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 	}
 
 	if spec.SaveCookiesPath != "" {
-		if err := saveCookies(jar, spec.SaveCookiesPath, parsedURL); err != nil {
+		cookies := jar.Cookies(parsedURL)
+		data, err := json.Marshal(cookies)
+		if err != nil {
+			return &ResponseDoc{
+				RequestedURL:  spec.URL,
+				ErrorCategory: "COOKIE_WRITE_FAILURE",
+				ExitCode:      1,
+				Body:          fmt.Sprintf("Failed to marshal cookies: %v", err),
+			}, nil
+		}
+
+		if err := scratchfs.SaveCookieFileAtomic(spec.SaveCookiesPath, data); err != nil {
 			return &ResponseDoc{
 				RequestedURL:  spec.URL,
 				ErrorCategory: "COOKIE_WRITE_FAILURE",
@@ -258,74 +274,6 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 	}
 
 	return doc, nil
-}
-
-func loadCookies(jar http.CookieJar, cookiePath string, targetURL *url.URL) error {
-	clean := filepath.Clean(cookiePath)
-	if !strings.HasPrefix(clean, "/scratch") {
-		return fmt.Errorf("cookie path outside /scratch")
-	}
-
-	// Verify regular file & size limit
-	info, err := os.Lstat(clean)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("cookie path '%s' is not a regular file", clean)
-	}
-	if info.Size() > 1048576 {
-		return fmt.Errorf("cookie file exceeds size limit (1MB)")
-	}
-
-	data, err := os.ReadFile(clean)
-	if err != nil {
-		return err
-	}
-	var cookies []*http.Cookie
-	if err := json.Unmarshal(data, &cookies); err == nil {
-		jar.SetCookies(targetURL, cookies)
-	}
-	return nil
-}
-
-func saveCookies(jar http.CookieJar, cookiePath string, targetURL *url.URL) error {
-	clean := filepath.Clean(cookiePath)
-	if !strings.HasPrefix(clean, "/scratch") {
-		return fmt.Errorf("cookie path outside /scratch")
-	}
-
-	cookies := jar.Cookies(targetURL)
-	data, err := json.Marshal(cookies)
-	if err != nil {
-		return err
-	}
-
-	// Atomic save via temp file in /scratch
-	dir := filepath.Dir(clean)
-	tmpFile, err := os.CreateTemp(dir, ".tmp_cookie_*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmpFile.Name()
-
-	if err := tmpFile.Chmod(0600); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	_ = tmpFile.Close()
-
-	return os.Rename(tmpName, clean)
 }
 
 func classifyError(err error) string {

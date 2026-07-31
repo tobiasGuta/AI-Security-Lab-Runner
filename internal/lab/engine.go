@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -88,15 +89,18 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 
 	composeContent, err := docker.GenerateComposeYAML(sess.ID, sess.OutboundEnabled, sess.HostGatewayEnabled, e.cfg)
 	if err != nil {
+		e.rollbackStartup(ctx, sess.ID)
 		return res, fmt.Errorf("failed to generate compose configuration: %w", err)
 	}
 
 	if err := os.WriteFile(sess.ComposeFilePath, []byte(composeContent), 0600); err != nil {
+		e.rollbackStartup(ctx, sess.ID)
 		return res, fmt.Errorf("failed to write compose file: %w", err)
 	}
 
 	snap, err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath)
 	if err != nil {
+		e.rollbackStartup(ctx, sess.ID)
 		return res, fmt.Errorf("failed to bring up runner container: %w", err)
 	}
 
@@ -185,18 +189,18 @@ func (e *Engine) StartSession(ctx context.Context, reqOutbound, reqHostAccess *b
 
 	composeContent, err := docker.GenerateComposeYAML(sess.ID, sess.OutboundEnabled, sess.HostGatewayEnabled, e.cfg)
 	if err != nil {
-		_, _ = e.cleanupSession(context.Background(), sess.ID)
+		e.rollbackStartup(ctx, sess.ID)
 		return nil, fmt.Errorf("failed to generate compose yaml: %w", err)
 	}
 
 	if err := os.WriteFile(sess.ComposeFilePath, []byte(composeContent), 0600); err != nil {
-		_, _ = e.cleanupSession(context.Background(), sess.ID)
+		e.rollbackStartup(ctx, sess.ID)
 		return nil, fmt.Errorf("failed to write compose file: %w", err)
 	}
 
 	snap, err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath)
 	if err != nil {
-		_, _ = e.cleanupSession(context.Background(), sess.ID)
+		e.rollbackStartup(ctx, sess.ID)
 		return nil, fmt.Errorf("docker compose up failed: %w", err)
 	}
 
@@ -317,6 +321,7 @@ func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []str
 	var sess *session.Session
 	var err error
 	var releaseLease func()
+	actualSessID := sessID
 
 	if sessID != "" {
 		releaseLease, err = e.sessMgr.AcquireExecLease(ctx, sessID)
@@ -351,19 +356,30 @@ func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []str
 			e.cfg.Limits.MaximumOutputBytes,
 		)
 	} else {
-		// Ephemeral execution path
+		// Ephemeral execution path with startup rollback
 		ephSess, createErr := e.sessMgr.CreateSession(session.ModeEphemeral, 15, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled)
 		if createErr != nil {
 			return nil, fmt.Errorf("failed to create ephemeral session: %w", createErr)
 		}
+		actualSessID = ephSess.ID
 		defer func() {
 			_, _ = e.cleanupSession(context.Background(), ephSess.ID)
 		}()
 
-		composeContent, _ := docker.GenerateComposeYAML(ephSess.ID, ephSess.OutboundEnabled, ephSess.HostGatewayEnabled, e.cfg)
-		_ = os.WriteFile(ephSess.ComposeFilePath, []byte(composeContent), 0600)
+		composeContent, genErr := docker.GenerateComposeYAML(ephSess.ID, ephSess.OutboundEnabled, ephSess.HostGatewayEnabled, e.cfg)
+		if genErr != nil {
+			e.rollbackStartup(ctx, ephSess.ID)
+			return nil, fmt.Errorf("ephemeral compose YAML failed: %w", genErr)
+		}
+
+		if writeErr := os.WriteFile(ephSess.ComposeFilePath, []byte(composeContent), 0600); writeErr != nil {
+			e.rollbackStartup(ctx, ephSess.ID)
+			return nil, fmt.Errorf("ephemeral write compose file failed: %w", writeErr)
+		}
+
 		snap, upErr := e.dockerClient.ComposeUp(ctx, ephSess.ComposeProject, ephSess.ComposeFilePath)
 		if upErr != nil {
+			e.rollbackStartup(ctx, ephSess.ID)
 			return nil, fmt.Errorf("ephemeral compose up failed: %w", upErr)
 		}
 		_ = e.sessMgr.UpdateSessionState(ephSess.ID, func(s *session.Session) {
@@ -393,7 +409,7 @@ func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []str
 	}
 
 	return &ExecResult{
-		SessionID:       sessID,
+		SessionID:       actualSessID,
 		ExitCode:        exitCode,
 		TimedOut:        timedOut,
 		DurationMS:      duration,
@@ -550,7 +566,6 @@ func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, off
 		return nil, fmt.Errorf("unsupported binary_encoding '%s' (must be 'utf-8' or 'base64')", binaryEncoding)
 	}
 
-	// Direct argv execution via sandbox-fs stat first to check file size
 	statArgv := []string{"/usr/local/bin/sandbox-fs", "stat", cleanPath}
 	statRes, err := e.execInternalArgv(ctx, sessID, statArgv, nil, 10)
 	if err != nil || statRes.ExitCode != 0 {
@@ -621,7 +636,6 @@ func (e *Engine) WriteFile(ctx context.Context, sessID, scratchPath, content, en
 		overwriteStr = "true"
 	}
 
-	// Pass file content directly through stdin to sandbox-fs
 	argv := []string{"/usr/local/bin/sandbox-fs", "write", cleanPath, overwriteStr}
 	res, err := e.execInternalArgv(ctx, sessID, argv, []byte(content), 15)
 	if err != nil || (res != nil && res.ExitCode != 0) {
@@ -705,6 +719,7 @@ func (e *Engine) Status(sessID string) (interface{}, error) {
 	return publicList, nil
 }
 
+// ExportFile streams the opened regular file directly via /usr/local/bin/sandbox-fs export into a host destination created with O_CREATE|O_EXCL mode 0600.
 func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName string) (interface{}, error) {
 	if !e.cfg.Security.AllowExport {
 		return nil, ErrExportDisabled
@@ -715,31 +730,12 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 		return nil, fmt.Errorf("export denied for path '%s': %w", scratchPath, err)
 	}
 
-	statArgv := []string{"/usr/local/bin/sandbox-fs", "stat", cleanScratch}
-	statRes, err := e.execInternalArgv(ctx, sessID, statArgv, nil, 10)
-	if err != nil || statRes.ExitCode != 0 {
-		return nil, fmt.Errorf("failed to stat export source file '%s': %v", cleanScratch, err)
-	}
-
-	var statObj map[string]interface{}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(statRes.Stdout)), &statObj); err != nil {
-		return nil, fmt.Errorf("failed to parse sandbox-fs stat output: %w", err)
-	}
-
-	if isRegular, ok := statObj["is_regular"].(bool); !ok || !isRegular {
-		return nil, fmt.Errorf("export source '%s' is not a regular file", cleanScratch)
-	}
-
-	fileSizeFloat, _ := statObj["size"].(float64)
-	if int64(fileSizeFloat) > e.cfg.Limits.MaximumExportBytes {
-		return nil, fmt.Errorf("file size %d exceeds maximum export limit %d", int64(fileSizeFloat), e.cfg.Limits.MaximumExportBytes)
-	}
-
+	// Validate destination name strictly: permit report.json, reject separators, .., UNC, control chars
 	if destName == "" {
 		destName = path.Base(cleanScratch)
 	}
-	destName = filepath.Base(filepath.Clean(destName))
-	if strings.ContainsAny(destName, "/\\..") || destName == "." || destName == ".." {
+	destBase := filepath.Base(filepath.Clean(destName))
+	if strings.ContainsAny(destName, "/\\:") || destName == "." || destName == ".." || destBase != destName || strings.HasPrefix(destName, ".") {
 		return nil, fmt.Errorf("invalid destination name '%s'", destName)
 	}
 
@@ -748,37 +744,81 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 		return nil, err
 	}
 
-	hostDest := filepath.Join(e.cfg.ExportDir, destName)
-	if _, err := os.Stat(hostDest); err == nil {
-		ext := filepath.Ext(destName)
-		base := strings.TrimSuffix(destName, ext)
-		destName = fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext)
-		hostDest = filepath.Join(e.cfg.ExportDir, destName)
+	if err := os.MkdirAll(e.cfg.ExportDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create export directory: %w", err)
 	}
 
+	hostDest := filepath.Join(e.cfg.ExportDir, destName)
 	cleanDest, err := pathsafe.ValidateHostPathUnderRoot(hostDest, e.cfg.ExportDir)
 	if err != nil {
 		return nil, fmt.Errorf("export destination path unsafe: %w", err)
 	}
 
-	if err := e.dockerClient.CopyFileFromRunner(ctx, sess.ComposeProject, cleanScratch, cleanDest); err != nil {
-		return nil, fmt.Errorf("failed to export file from container: %w", err)
-	}
-
-	data, err := os.ReadFile(cleanDest)
+	// Host temp file created with O_CREATE | O_EXCL mode 0600
+	tempDest := fmt.Sprintf("%s.tmp_%d", cleanDest, time.Now().UnixNano())
+	outFlags := os.O_CREATE | os.O_WRONLY | os.O_EXCL
+	outFile, err := os.OpenFile(tempDest, outFlags, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read exported file for hashing: %w", err)
+		return nil, fmt.Errorf("failed to create host export temp file: %w", err)
 	}
 
-	hash := sha256.Sum256(data)
-	shaHex := hex.EncodeToString(hash[:])
+	hasher := sha256.New()
+	mw := io.MultiWriter(outFile, hasher)
+
+	// Direct argv execution of sandbox-fs export streaming binary stdout to MultiWriter
+	argv := []string{"/usr/local/bin/sandbox-fs", "export", cleanScratch}
+	timeoutSec := 30
+	timeout := time.Duration(timeoutSec) * time.Second
+
+	releaseLease, leaseErr := e.sessMgr.AcquireExecLease(ctx, sessID)
+	if leaseErr != nil {
+		_ = outFile.Close()
+		_ = os.Remove(tempDest)
+		return nil, fmt.Errorf("export execution lease denied: %w", leaseErr)
+	}
+
+	exitCode, stderrMsg, timedOut, _, execErr := e.dockerClient.ExecArgvWithBinaryStdoutInRunner(
+		ctx,
+		sess.ComposeProject,
+		sess.ComposeFilePath,
+		"/scratch",
+		argv,
+		nil,
+		nil,
+		timeout,
+		mw,
+		e.cfg.Limits.MaximumExportBytes,
+	)
+	releaseLease()
+
+	if execErr != nil || exitCode != 0 || timedOut {
+		_ = outFile.Close()
+		_ = os.Remove(tempDest)
+		return nil, fmt.Errorf("export streaming failed (exit code %d, stderr: %s): %v", exitCode, stderrMsg, execErr)
+	}
+
+	_ = outFile.Sync()
+	_ = outFile.Close()
+
+	// Atomically publish completed export
+	if err := os.Rename(tempDest, cleanDest); err != nil {
+		_ = os.Remove(tempDest)
+		return nil, fmt.Errorf("failed to publish completed export file: %w", err)
+	}
+
+	shaHex := hex.EncodeToString(hasher.Sum(nil))
+	info, _ := os.Stat(cleanDest)
+	fileBytes := int64(0)
+	if info != nil {
+		fileBytes = info.Size()
+	}
 
 	return map[string]interface{}{
 		"session_id":  sessID,
 		"source_path": cleanScratch,
 		"export_path": cleanDest,
 		"sha256":      shaHex,
-		"bytes":       int64(len(data)),
+		"bytes":       fileBytes,
 	}, nil
 }
 
@@ -804,41 +844,54 @@ func (e *Engine) cleanupSession(ctx context.Context, sessID string) (session.Cle
 		RunnerContainerID: sess.RunnerContainerID,
 		NetworkID:         sess.NetworkID,
 		ScratchVolumeName: sess.VolumeName,
+		ComposeProject:    sess.ComposeProject,
 	}
 
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.cfg.Limits.ShutdownGraceSeconds)*time.Second)
-	defer cancel()
+	downCtx, downCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer downCancel()
 
-	// 1. Ownership verification
-	if err := e.dockerClient.VerifyResourceOwnership(cleanupCtx, sess.ComposeProject, sess.ID, snap); err != nil {
-		summary.CleanupError = fmt.Sprintf("ownership verification failed: %v", err)
+	// 1. Inspect present resources & verify ownership
+	insp, inspErr := e.dockerClient.InspectResources(downCtx, sess.ComposeProject, sess.ID, snap)
+	if inspErr != nil {
+		summary.CleanupError = fmt.Sprintf("resource inspection failed: %v", inspErr)
 		e.recordCleanupFailure(sessID, summary)
-		return summary, fmt.Errorf("ownership verification failed for session %s: %w", sessID, err)
+		return summary, inspErr
+	}
+
+	if (insp.Runner.Present && !insp.Runner.OwnershipVerified) ||
+		(insp.Network.Present && !insp.Network.OwnershipVerified) ||
+		(insp.ScratchVolume.Present && !insp.ScratchVolume.OwnershipVerified) {
+		summary.CleanupError = "mismatching present resource detected, cleanup halted"
+		e.recordCleanupFailure(sessID, summary)
+		return summary, errors.New(summary.CleanupError)
 	}
 
 	// 2. Mark session stopping and wait for active exec leases to complete
-	if err := e.sessMgr.BeginStopping(cleanupCtx, sessID); err != nil {
+	if err := e.sessMgr.BeginStopping(downCtx, sessID); err != nil {
 		summary.CleanupError = fmt.Sprintf("failed to begin stopping session: %v", err)
 		e.recordCleanupFailure(sessID, summary)
 		return summary, err
 	}
 
-	// 3. Run Docker ComposeDown
-	downErr := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath)
+	// 3. Run Docker ComposeDown to remove present matching resources
+	downErr := e.dockerClient.ComposeDown(downCtx, sess.ComposeProject, sess.ComposeFilePath)
 
-	// 4. Inspect resources post-cleanup
-	runnerRemoved, networkRemoved, scratchRemoved, _ := e.dockerClient.VerifyResourcesAbsent(cleanupCtx, sess.ComposeProject, sess.ID, snap)
+	// 4. Verify resources absent (FAIL CLOSED) using a fresh context
+	absCtx, absCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer absCancel()
+
+	runnerRemoved, networkRemoved, scratchRemoved, absErr := e.dockerClient.VerifyResourcesAbsent(absCtx, sess.ComposeProject, sess.ID, snap)
 	summary.RunnerRemoved = runnerRemoved
 	summary.NetworkRemoved = networkRemoved
 	summary.ScratchRemoved = scratchRemoved
 
-	if downErr != nil || !runnerRemoved || !networkRemoved || !scratchRemoved {
-		summary.CleanupError = fmt.Sprintf("docker cleanup incomplete (downErr: %v, runner: %v, net: %v, vol: %v)", downErr, runnerRemoved, networkRemoved, scratchRemoved)
+	if absErr != nil || downErr != nil || !runnerRemoved || !networkRemoved || !scratchRemoved {
+		summary.CleanupError = fmt.Sprintf("docker cleanup incomplete (absErr: %v, downErr: %v, runner: %v, net: %v, vol: %v)", absErr, downErr, runnerRemoved, networkRemoved, scratchRemoved)
 		e.recordCleanupFailure(sessID, summary)
 		return summary, fmt.Errorf("cleanup incomplete for session %s", sessID)
 	}
 
-	// 5. Remove session state ONLY when all owned resources are confirmed gone
+	// 5. Remove session state ONLY when all owned resources are confirmed absent
 	if err := e.sessMgr.RemoveSession(sessID); err != nil {
 		summary.CleanupError = fmt.Sprintf("failed to remove state directory: %v", err)
 		e.recordCleanupFailure(sessID, summary)
@@ -858,6 +911,38 @@ func (e *Engine) cleanupSession(ctx context.Context, sessID string) (session.Cle
 	}
 
 	return summary, nil
+}
+
+func (e *Engine) rollbackStartup(ctx context.Context, sessID string) {
+	sess, err := e.sessMgr.GetSession(sessID)
+	if err != nil {
+		return
+	}
+
+	snap := docker.ResourceSnapshot{
+		RunnerContainerID: sess.RunnerContainerID,
+		NetworkID:         sess.NetworkID,
+		ScratchVolumeName: sess.VolumeName,
+		ComposeProject:    sess.ComposeProject,
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.cfg.Limits.ShutdownGraceSeconds)*time.Second)
+	defer cancel()
+
+	_ = e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath)
+	rRem, nRem, sRem, _ := e.dockerClient.VerifyResourcesAbsent(cleanupCtx, sess.ComposeProject, sess.ID, snap)
+
+	if rRem && nRem && sRem {
+		_ = e.sessMgr.RemoveSession(sessID)
+	} else {
+		e.recordCleanupFailure(sessID, session.CleanupSummary{
+			RunnerRemoved:    rRem,
+			NetworkRemoved:   nRem,
+			ScratchRemoved:   sRem,
+			CleanupError:     "startup rollback incomplete",
+			CleanupRetryable: true,
+		})
+	}
 }
 
 func (e *Engine) recordCleanupFailure(sessID string, summary session.CleanupSummary) {

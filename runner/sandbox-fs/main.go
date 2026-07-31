@@ -7,17 +7,15 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
-)
 
-const scratchRoot = "/scratch"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/runner/internal/scratchfs"
+)
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: sandbox-fs read|write|stat|hash <path> [args...]\n")
+		fmt.Fprintf(os.Stderr, "Usage: sandbox-fs read|write|stat|hash|export <path> [args...]\n")
 		os.Exit(1)
 	}
 
@@ -31,6 +29,8 @@ func main() {
 		cmdStat(os.Args[2:])
 	case "hash":
 		cmdHash(os.Args[2:])
+	case "export":
+		cmdExport(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown subcommand: %s\n", subcommand)
 		os.Exit(1)
@@ -44,7 +44,7 @@ func cmdRead(args []string) {
 	}
 
 	p := args[0]
-	f, cleanPath, err := openScratchPathFd(p, syscall.O_RDONLY, 0)
+	f, cleanPath, err := scratchfs.OpenScratchFd(p, syscall.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
@@ -102,13 +102,13 @@ func cmdWrite(args []string) {
 		overwrite = true
 	}
 
-	cleaned := filepath.Clean(p)
-	if !strings.HasPrefix(cleaned, scratchRoot) || cleaned == scratchRoot {
-		fmt.Fprintf(os.Stderr, "Security Violation: path '%s' invalid\n", p)
+	cleaned, _, err := scratchfs.ValidateScratchPath(p, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
 	}
 
-	if err := mkdiratScratchPath(cleaned); err != nil {
+	if err := scratchfs.MkdiratScratch(cleaned); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create parent directories: %v\n", err)
 		os.Exit(1)
 	}
@@ -120,9 +120,9 @@ func cmdWrite(args []string) {
 		flags = syscall.O_CREAT | syscall.O_WRONLY | syscall.O_EXCL
 	}
 
-	f, cleanPath, err := openScratchPathFd(cleaned, flags, 0644)
+	f, cleanPath, err := scratchfs.OpenScratchFd(cleaned, flags, 0644)
 	if err != nil {
-		if os.IsExist(err) || strings.Contains(err.Error(), "exist") {
+		if os.IsExist(err) {
 			fmt.Fprintf(os.Stderr, "Error: file '%s' already exists and overwrite is false\n", cleaned)
 			os.Exit(17)
 		}
@@ -153,7 +153,7 @@ func cmdStat(args []string) {
 	}
 
 	p := args[0]
-	f, cleanPath, err := openScratchPathFd(p, syscall.O_RDONLY, 0)
+	f, cleanPath, err := scratchfs.OpenScratchFd(p, syscall.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
@@ -187,7 +187,7 @@ func cmdHash(args []string) {
 	}
 
 	p := args[0]
-	f, cleanPath, err := openScratchPathFd(p, syscall.O_RDONLY, 0)
+	f, cleanPath, err := scratchfs.OpenScratchFd(p, syscall.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
@@ -207,4 +207,31 @@ func cmdHash(args []string) {
 	}
 
 	fmt.Println(hex.EncodeToString(h.Sum(nil)))
+}
+
+func cmdExport(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: sandbox-fs export <path>\n")
+		os.Exit(1)
+	}
+
+	p := args[0]
+	f, cleanPath, err := scratchfs.OpenScratchFd(p, syscall.O_RDONLY, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
+		os.Exit(2)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		fmt.Fprintf(os.Stderr, "Error: '%s' is not a regular file\n", cleanPath)
+		os.Exit(2)
+	}
+
+	// Stream exact opened regular file binary content directly to stdout
+	if _, err := io.Copy(os.Stdout, f); err != nil {
+		fmt.Fprintf(os.Stderr, "Export stream error: %v\n", err)
+		os.Exit(1)
+	}
 }

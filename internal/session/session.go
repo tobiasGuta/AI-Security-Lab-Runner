@@ -340,6 +340,9 @@ func (m *Manager) ListSessions() []Session {
 	list := make([]Session, 0, len(m.sessions))
 	now := time.Now().UTC()
 	for _, s := range m.sessions {
+		if s.Mode == ModeEphemeral {
+			continue // Ephemeral sessions are internal transient sessions
+		}
 		if now.After(s.ExpiresAt) && (s.Status == StateReady || s.Status == StateCreated) {
 			s.Status = StateExpired
 			_ = m.saveSessionLocked(s)
