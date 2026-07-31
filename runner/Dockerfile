@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Compile and install trusted sandbox-fs helper binary
 COPY sandbox-fs /tmp/sandbox-fs-build
-RUN cd /tmp/sandbox-fs-build && go build -o /usr/local/bin/sandbox-fs main.go && rm -rf /tmp/sandbox-fs-build
+RUN cd /tmp/sandbox-fs-build && go build -o /usr/local/bin/sandbox-fs main.go fd_linux.go && rm -rf /tmp/sandbox-fs-build
 
 # Non-root user setup (agent: 10001)
 RUN groupadd -g 10001 agent && \

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -70,9 +71,12 @@ type RunResult struct {
 	Cleanup         CleanupSummary `json:"cleanup"`
 }
 
-// Run executes a one-shot command in a disposable, ephemeral sandbox container with deferred cleanup.
+// Run executes a one-shot command in a disposable, ephemeral sandbox container with deferred verified cleanup.
 func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, env map[string]string) (*RunResult, error) {
-	sess, err := e.sessMgr.CreateSession(session.ModeEphemeral, 15)
+	// Clamp timeout against MaximumTimeoutSeconds
+	timeoutSec = e.clampTimeout(timeoutSec)
+
+	sess, err := e.sessMgr.CreateSession(session.ModeEphemeral, 15, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ephemeral session: %w", err)
 	}
@@ -82,20 +86,25 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 		Ephemeral: true,
 	}
 
-	// Defer auto-cleanup on ALL execution paths (success, failure, timeout, error)
+	// Defer verified auto-cleanup using independent background context
 	defer func() {
-		_ = e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath)
-		_ = e.sessMgr.RemoveSession(sess.ID)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		downErr := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath)
+		removeErr := e.sessMgr.RemoveSession(sess.ID)
+
+		success := downErr == nil && removeErr == nil
 		res.Cleanup = CleanupSummary{
-			RunnerRemoved:  true,
-			ScratchRemoved: true,
-			NetworkRemoved: true,
+			RunnerRemoved:  success,
+			ScratchRemoved: success,
+			NetworkRemoved: success,
 		}
 	}()
 
 	_ = e.sessMgr.Transition(sess.ID, session.StateCreated, session.StateStarting)
 
-	composeContent, err := docker.GenerateComposeYAML(sess.ID, e.cfg)
+	composeContent, err := docker.GenerateComposeYAML(sess.ID, sess.OutboundEnabled, sess.HostGatewayEnabled, e.cfg)
 	if err != nil {
 		return res, fmt.Errorf("failed to generate compose configuration: %w", err)
 	}
@@ -169,14 +178,14 @@ type StartResult struct {
 }
 
 func (e *Engine) StartSession(ctx context.Context, outboundNetwork, hostAccess bool, ttlMinutes int) (*StartResult, error) {
-	sess, err := e.sessMgr.CreateSession(session.ModePersistent, ttlMinutes)
+	sess, err := e.sessMgr.CreateSession(session.ModePersistent, ttlMinutes, outboundNetwork, hostAccess)
 	if err != nil {
 		return nil, err
 	}
 
 	_ = e.sessMgr.Transition(sess.ID, session.StateCreated, session.StateStarting)
 
-	composeContent, err := docker.GenerateComposeYAML(sess.ID, e.cfg)
+	composeContent, err := docker.GenerateComposeYAML(sess.ID, sess.OutboundEnabled, sess.HostGatewayEnabled, e.cfg)
 	if err != nil {
 		_ = e.sessMgr.RemoveSession(sess.ID)
 		return nil, fmt.Errorf("failed to generate compose yaml: %w", err)
@@ -204,12 +213,16 @@ func (e *Engine) StartSession(ctx context.Context, outboundNetwork, hostAccess b
 		})
 	}
 
+	netPolicy := e.cfg.Network
+	netPolicy.OutboundEnabled = sess.OutboundEnabled
+	netPolicy.HostGatewayEnabled = sess.HostGatewayEnabled
+
 	return &StartResult{
 		SessionID:     sess.ID,
 		Status:        string(session.StateReady),
 		CreatedAt:     sess.CreatedAt,
 		ExpiresAt:     sess.ExpiresAt,
-		Network:       e.cfg.Network,
+		Network:       netPolicy,
 		HostGateway:   e.cfg.Network.HostGatewayName,
 		PolicySummary: security.GetPolicySummary(e.cfg),
 	}, nil
@@ -227,6 +240,9 @@ type ExecResult struct {
 }
 
 func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutSec int, env map[string]string) (*ExecResult, error) {
+	// Clamp timeout against MaximumTimeoutSeconds
+	timeoutSec = e.clampTimeout(timeoutSec)
+
 	sess, err := e.sessMgr.GetSession(sessID)
 	if err != nil {
 		return nil, err
@@ -255,9 +271,6 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 	defer func() { _ = e.sessMgr.SetActiveExecCount(sessID, -1) }()
 
 	timeout := time.Duration(timeoutSec) * time.Second
-	if timeout <= 0 {
-		timeout = time.Duration(e.cfg.Limits.DefaultTimeoutSeconds) * time.Second
-	}
 
 	start := time.Now()
 	exitCode, stdout, stderr, timedOut, truncated, err := e.dockerClient.ExecInRunner(
@@ -365,54 +378,74 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		curlConnectTo = fmt.Sprintf("%s:%s:%s:%s", hostname, port, connectionHost, port)
 	}
 
-	// Build curl command array
-	var curlArgs []string
-	curlArgs = append(curlArgs, "curl", "-s", "-i", "-X", method)
+	// Safely pass HTTP spec parameters via temporary base64 payload inside container to eliminate shell expansion/injection
+	reqSpecID := audit.GenerateEventID()
+	bodyB64 := base64.StdEncoding.EncodeToString([]byte(opts.Body))
 
-	if opts.FollowRedirects {
-		curlArgs = append(curlArgs, "-L")
-	}
-	if opts.InsecureTLS {
-		curlArgs = append(curlArgs, "-k")
-	}
-	if curlConnectTo != "" {
-		curlArgs = append(curlArgs, "--connect-to", curlConnectTo)
-	}
-
-	// Header validation and arguments
-	for k, v := range opts.Headers {
+	// Validate header names
+	for k := range opts.Headers {
 		if strings.ContainsAny(k, "\r\n:") {
 			return nil, fmt.Errorf("%w: invalid header name '%s'", ErrInvalidHeaderName, k)
 		}
-		curlArgs = append(curlArgs, "-H", fmt.Sprintf("%s: %s", k, v))
 	}
 
+	headersJSON, _ := json.Marshal(opts.Headers)
+	headersB64 := base64.StdEncoding.EncodeToString(headersJSON)
+
+	var extraFlags []string
+	if opts.FollowRedirects {
+		extraFlags = append(extraFlags, "-L")
+	}
+	if opts.InsecureTLS {
+		extraFlags = append(extraFlags, "-k")
+	}
+	if curlConnectTo != "" {
+		extraFlags = append(extraFlags, "--connect-to", curlConnectTo)
+	}
 	if opts.LoadCookiesPath != "" {
-		cleanCookiePath, err := pathsafe.ValidateContainerPathUnderAllowed(opts.LoadCookiesPath, []string{"/scratch"})
-		if err == nil {
-			curlArgs = append(curlArgs, "-b", cleanCookiePath)
+		if clean, err := pathsafe.ValidateContainerPathUnderAllowed(opts.LoadCookiesPath, []string{"/scratch"}); err == nil {
+			extraFlags = append(extraFlags, "-b", clean)
 		}
 	}
 	if opts.SaveCookiesPath != "" {
-		cleanCookiePath, err := pathsafe.ValidateContainerPathUnderAllowed(opts.SaveCookiesPath, []string{"/scratch"})
-		if err == nil {
-			curlArgs = append(curlArgs, "-c", cleanCookiePath)
+		if clean, err := pathsafe.ValidateContainerPathUnderAllowed(opts.SaveCookiesPath, []string{"/scratch"}); err == nil {
+			extraFlags = append(extraFlags, "-c", clean)
 		}
 	}
 
-	if opts.Body != "" {
-		curlArgs = append(curlArgs, "-d", opts.Body)
-	}
+	flagsStr := strings.Join(extraFlags, " ")
 
-	curlArgs = append(curlArgs, fmt.Sprintf("%q", opts.URL))
+	// Shell payload executes python3 or node inside runner to construct curl command cleanly without host argument breaking
+	pyScript := fmt.Sprintf(`import base64, json, subprocess, sys
+body = base64.b64decode("%s")
+headers = json.loads(base64.b64decode("%s"))
+url = "%s"
+method = "%s"
+extra_flags = "%s".split() if "%s" else []
 
-	fullCurlCmd := strings.Join(curlArgs, " ")
+cmd = ["curl", "-s", "-i", "-X", method] + extra_flags
+for k, v in headers.items():
+    cmd.extend(["-H", f"{k}: {v}"])
+if body:
+    cmd.extend(["--data-binary", "@-"])
+cmd.append(url)
+
+proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+stdout, stderr = proc.communicate(input=body)
+sys.stdout.buffer.write(stdout)
+sys.exit(proc.returncode)
+`, bodyB64, headersB64, opts.URL, method, flagsStr, flagsStr)
+
+	pyScriptB64 := base64.StdEncoding.EncodeToString([]byte(pyScript))
+	execCmd := fmt.Sprintf("echo '%s' | base64 -d | python3 - %s", pyScriptB64, reqSpecID)
+
+	opts.TimeoutSeconds = e.clampTimeout(opts.TimeoutSeconds)
 
 	var execRes *ExecResult
 	if opts.SessionID != "" {
-		execRes, err = e.Exec(ctx, opts.SessionID, fullCurlCmd, "/scratch", opts.TimeoutSeconds, nil)
+		execRes, err = e.Exec(ctx, opts.SessionID, execCmd, "/scratch", opts.TimeoutSeconds, nil)
 	} else {
-		runRes, err := e.Run(ctx, fullCurlCmd, "/scratch", opts.TimeoutSeconds, nil)
+		runRes, err := e.Run(ctx, execCmd, "/scratch", opts.TimeoutSeconds, nil)
 		if err == nil {
 			execRes = &ExecResult{
 				SessionID:       runRes.SessionID,
@@ -432,7 +465,6 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		return nil, err
 	}
 
-	// Parse HTTP status & response headers from curl -i output
 	statusCode := 0
 	resHeaders := make(map[string]string)
 	bodyStr := execRes.Stdout
@@ -651,11 +683,19 @@ func (e *Engine) StopSession(ctx context.Context, sessID string) error {
 		return err
 	}
 
-	// Verify resource ownership before destructive removal
-	_ = e.dockerClient.VerifyResourceOwnership(ctx, sess.ComposeProject, sess.ID)
+	// Verify resource ownership before destructive removal; abort if verification fails
+	if err := e.dockerClient.VerifyResourceOwnership(ctx, sess.ComposeProject, sess.ID); err != nil {
+		sess.CleanupState = "cleanup-failed"
+		_ = e.sessMgr.Transition(sessID, "", session.StateCleanupFailed)
+		return fmt.Errorf("ownership verification failed for session %s: %w", sessID, err)
+	}
 
 	_ = e.sessMgr.Transition(sessID, "", session.StateStopping)
-	if err := e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
 		sess.CleanupState = "cleanup-failed"
 		_ = e.sessMgr.Transition(sessID, "", session.StateCleanupFailed)
 		return fmt.Errorf("failed to stop session containers: %w", err)
@@ -675,8 +715,16 @@ func (e *Engine) StopSession(ctx context.Context, sessID string) error {
 }
 
 func (e *Engine) ResetSession(ctx context.Context, sessID string) (*StartResult, error) {
+	sess, err := e.sessMgr.GetSession(sessID)
+	outbound := e.cfg.Network.OutboundEnabled
+	hostAccess := e.cfg.Network.HostGatewayEnabled
+	if err == nil {
+		outbound = sess.OutboundEnabled
+		hostAccess = sess.HostGatewayEnabled
+	}
+
 	_ = e.StopSession(ctx, sessID)
-	return e.StartSession(ctx, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled, e.cfg.Limits.DefaultSessionTTLMinutes)
+	return e.StartSession(ctx, outbound, hostAccess, e.cfg.Limits.DefaultSessionTTLMinutes)
 }
 
 func (e *Engine) GetAuditSummary(sessionID string, limit int) ([]audit.Event, error) {
@@ -684,4 +732,14 @@ func (e *Engine) GetAuditSummary(sessionID string, limit int) ([]audit.Event, er
 		return []audit.Event{}, nil
 	}
 	return e.auditLogger.GetSummaryForSession(sessionID, limit)
+}
+
+func (e *Engine) clampTimeout(userTimeout int) int {
+	if userTimeout <= 0 {
+		return e.cfg.Limits.DefaultTimeoutSeconds
+	}
+	if userTimeout > e.cfg.Limits.MaximumTimeoutSeconds {
+		return e.cfg.Limits.MaximumTimeoutSeconds
+	}
+	return userTimeout
 }

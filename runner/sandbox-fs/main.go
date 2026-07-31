@@ -36,67 +36,6 @@ func main() {
 	}
 }
 
-// validateScratchPath checks that target is within /scratch without escaping through symlinks.
-func validateScratchPath(p string) (string, error) {
-	if p == "" {
-		return "", fmt.Errorf("path is empty")
-	}
-
-	cleaned := filepath.Clean(p)
-	if !strings.HasPrefix(cleaned, scratchRoot) {
-		return "", fmt.Errorf("path '%s' is not beneath '%s'", p, scratchRoot)
-	}
-
-	// Lstat each component starting from scratchRoot
-	rel, err := filepath.Rel(scratchRoot, cleaned)
-	if err != nil {
-		return "", fmt.Errorf("failed to evaluate relative path: %w", err)
-	}
-
-	if rel == "." {
-		return scratchRoot, nil
-	}
-
-	parts := strings.Split(rel, string(filepath.Separator))
-	curr := scratchRoot
-	for _, part := range parts {
-		curr = filepath.Join(curr, part)
-		info, err := os.Lstat(curr)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// Path component doesn't exist yet (okay for write)
-				break
-			}
-			return "", fmt.Errorf("lstat failed for component '%s': %w", curr, err)
-		}
-
-		if info.Mode()&os.ModeSymlink != 0 {
-			// Resolve symlink target
-			target, err := os.Readlink(curr)
-			if err != nil {
-				return "", fmt.Errorf("failed to read symlink '%s': %w", curr, err)
-			}
-
-			var resolvedTarget string
-			if filepath.IsAbs(target) {
-				resolvedTarget = filepath.Clean(target)
-			} else {
-				resolvedTarget = filepath.Clean(filepath.Join(filepath.Dir(curr), target))
-			}
-
-			if !strings.HasPrefix(resolvedTarget, scratchRoot) {
-				return "", fmt.Errorf("symlink '%s' points outside /scratch to '%s'", curr, resolvedTarget)
-			}
-		}
-
-		if info.Mode()&(os.ModeDevice|os.ModeSocket|os.ModeNamedPipe|os.ModeCharDevice) != 0 {
-			return "", fmt.Errorf("path '%s' is an unsupported special file", curr)
-		}
-	}
-
-	return cleaned, nil
-}
-
 func cmdRead(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "Usage: sandbox-fs read <path> [offset] [maxBytes]\n")
@@ -104,13 +43,14 @@ func cmdRead(args []string) {
 	}
 
 	p := args[0]
-	cleanPath, err := validateScratchPath(p)
+	f, cleanPath, err := openScratchPathFd(p, os.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
 	}
+	defer f.Close()
 
-	info, err := os.Lstat(cleanPath)
+	info, err := f.Stat()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "File not found: %v\n", err)
 		os.Exit(1)
@@ -134,13 +74,6 @@ func cmdRead(args []string) {
 			maxBytes = val
 		}
 	}
-
-	f, err := os.Open(cleanPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open file: %v\n", err)
-		os.Exit(1)
-	}
-	defer f.Close()
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
@@ -168,57 +101,44 @@ func cmdWrite(args []string) {
 		overwrite = true
 	}
 
-	cleanPath, err := validateScratchPath(p)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
+	cleaned := filepath.Clean(p)
+	if !strings.HasPrefix(cleaned, scratchRoot) || cleaned == scratchRoot {
+		fmt.Fprintf(os.Stderr, "Security Violation: path '%s' invalid\n", p)
 		os.Exit(2)
 	}
 
-	if cleanPath == scratchRoot || cleanPath == scratchRoot+"/" {
-		fmt.Fprintf(os.Stderr, "Error: cannot write directly to /scratch as a file\n")
-		os.Exit(2)
-	}
-
-	dir := filepath.Dir(cleanPath)
+	dir := filepath.Dir(cleaned)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create directory: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Check existing target
-	if info, err := os.Lstat(cleanPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			fmt.Fprintf(os.Stderr, "Security Violation: cannot overwrite symbolic link '%s'\n", cleanPath)
-			os.Exit(2)
-		}
-		if !info.Mode().IsRegular() {
-			fmt.Fprintf(os.Stderr, "Error: '%s' is not a regular file\n", cleanPath)
+	// Check if target exists using descriptor-relative O_NOFOLLOW
+	if f, _, err := openScratchPathFd(cleaned, os.O_RDONLY, 0); err == nil {
+		info, _ := f.Stat()
+		_ = f.Close()
+		if info != nil && !info.Mode().IsRegular() {
+			fmt.Fprintf(os.Stderr, "Error: '%s' is not a regular file\n", cleaned)
 			os.Exit(2)
 		}
 		if !overwrite {
-			fmt.Fprintf(os.Stderr, "Error: file '%s' already exists and overwrite is false\n", cleanPath)
+			fmt.Fprintf(os.Stderr, "Error: file '%s' already exists and overwrite is false\n", cleaned)
 			os.Exit(17)
 		}
 	}
 
-	tmpFile := cleanPath + ".tmp"
-	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Write directly via descriptor-relative O_CREATE | O_WRONLY | O_TRUNC
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	f, _, err := openScratchPathFd(cleaned, flags, 0644)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create temporary file: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
+		os.Exit(2)
 	}
+	defer f.Close()
 
 	n, err := io.Copy(f, os.Stdin)
-	_ = f.Close()
 	if err != nil {
-		_ = os.Remove(tmpFile)
-		fmt.Fprintf(os.Stderr, "Failed to write file payload: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := os.Rename(tmpFile, cleanPath); err != nil {
-		_ = os.Remove(tmpFile)
-		fmt.Fprintf(os.Stderr, "Failed to move file atomically: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to write payload: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -232,13 +152,14 @@ func cmdStat(args []string) {
 	}
 
 	p := args[0]
-	cleanPath, err := validateScratchPath(p)
+	f, cleanPath, err := openScratchPathFd(p, os.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
 	}
+	defer f.Close()
 
-	info, err := os.Lstat(cleanPath)
+	info, err := f.Stat()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Stat error: %v\n", err)
 		os.Exit(1)
@@ -265,24 +186,18 @@ func cmdHash(args []string) {
 	}
 
 	p := args[0]
-	cleanPath, err := validateScratchPath(p)
+	f, cleanPath, err := openScratchPathFd(p, os.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
 	}
+	defer f.Close()
 
-	info, err := os.Lstat(cleanPath)
+	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		fmt.Fprintf(os.Stderr, "Error: '%s' is not a regular file\n", cleanPath)
 		os.Exit(2)
 	}
-
-	f, err := os.Open(cleanPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open file: %v\n", err)
-		os.Exit(1)
-	}
-	defer f.Close()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {

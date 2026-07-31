@@ -10,7 +10,7 @@ import (
 func TestGenerateComposeYAMLRunnerOnly(t *testing.T) {
 	cfg := config.DefaultConfig()
 
-	yamlStr, err := GenerateComposeYAML("sess-12345", cfg)
+	yamlStr, err := GenerateComposeYAML("sess-12345", true, true, cfg)
 	if err != nil {
 		t.Fatalf("GenerateComposeYAML failed: %v", err)
 	}

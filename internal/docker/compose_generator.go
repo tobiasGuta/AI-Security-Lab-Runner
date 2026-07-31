@@ -45,8 +45,8 @@ type ComposeVolume struct {
 	Labels map[string]string `yaml:"labels"`
 }
 
-// GenerateComposeYAML builds a runner-only Docker Compose configuration.
-func GenerateComposeYAML(sessID string, cfg *config.Config) (string, error) {
+// GenerateComposeYAML builds a runner-only Docker Compose configuration adhering to session network overrides.
+func GenerateComposeYAML(sessID string, outboundEnabled, hostGatewayEnabled bool, cfg *config.Config) (string, error) {
 	labels := map[string]string{
 		"ai.security.lab-runner.managed": "true",
 		"ai.security.lab-runner.kind":    "sandbox-runner",
@@ -56,7 +56,7 @@ func GenerateComposeYAML(sessID string, cfg *config.Config) (string, error) {
 	scratchVolName := fmt.Sprintf("sandbox-scratch-%s", sessID)
 
 	var extraHosts []string
-	if cfg.Network.HostGatewayEnabled {
+	if hostGatewayEnabled {
 		gwName := cfg.Network.HostGatewayName
 		if gwName == "" {
 			gwName = "host.docker.internal"
@@ -89,7 +89,7 @@ func GenerateComposeYAML(sessID string, cfg *config.Config) (string, error) {
 
 	networks := map[string]ComposeNetwork{
 		"sandbox": {
-			Internal: !cfg.Network.OutboundEnabled,
+			Internal: !outboundEnabled,
 			Labels: map[string]string{
 				"ai.security.lab-runner.managed": "true",
 				"ai.security.lab-runner.kind":    "sandbox-network",

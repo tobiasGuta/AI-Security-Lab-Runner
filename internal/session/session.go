@@ -44,19 +44,21 @@ const (
 )
 
 type Session struct {
-	ID                string                `json:"session_id"`
-	Mode              Mode                  `json:"mode"`
-	ComposeProject    string                `json:"compose_project"`
-	ComposeFilePath   string                `json:"compose_file_path"`
-	CreatedAt         time.Time             `json:"created_at"`
-	ExpiresAt         time.Time             `json:"expires_at"`
-	Status            State                 `json:"status"`
-	RunnerContainerID string                `json:"runner_container_id,omitempty"`
-	ScratchVolumeName string                `json:"scratch_volume_name"`
-	ActiveExecCount   int                   `json:"active_exec_count"`
-	CleanupState      string                `json:"cleanup_state"`
-	NetworkPolicy     config.NetworkConfig  `json:"network_policy"`
-	SecurityPolicy    config.SecurityConfig `json:"security_policy"`
+	ID                 string                `json:"session_id"`
+	Mode               Mode                  `json:"mode"`
+	ComposeProject     string                `json:"compose_project"`
+	ComposeFilePath    string                `json:"compose_file_path"`
+	CreatedAt          time.Time             `json:"created_at"`
+	ExpiresAt          time.Time             `json:"expires_at"`
+	Status             State                 `json:"status"`
+	RunnerContainerID  string                `json:"runner_container_id,omitempty"`
+	ScratchVolumeName  string                `json:"scratch_volume_name"`
+	ActiveExecCount    int                   `json:"active_exec_count"`
+	CleanupState       string                `json:"cleanup_state"`
+	OutboundEnabled    bool                  `json:"outbound_enabled"`
+	HostGatewayEnabled bool                  `json:"host_gateway_enabled"`
+	NetworkPolicy      config.NetworkConfig  `json:"network_policy"`
+	SecurityPolicy     config.SecurityConfig `json:"security_policy"`
 }
 
 type Manager struct {
@@ -96,7 +98,7 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	return m, nil
 }
 
-func (m *Manager) CreateSession(mode Mode, ttlMinutes int) (*Session, error) {
+func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, hostGatewayEnabled bool) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -134,18 +136,24 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int) (*Session, error) {
 	composeProject := fmt.Sprintf("sandbox_%s", id[:8])
 	scratchVolName := fmt.Sprintf("sandbox-scratch-%s", id)
 
+	netPolicy := m.cfg.Network
+	netPolicy.OutboundEnabled = outboundEnabled
+	netPolicy.HostGatewayEnabled = hostGatewayEnabled
+
 	s := &Session{
-		ID:                id,
-		Mode:              mode,
-		ComposeProject:    composeProject,
-		ComposeFilePath:   composeFile,
-		CreatedAt:         now,
-		ExpiresAt:         now.Add(ttl),
-		Status:            StateCreated,
-		ScratchVolumeName: scratchVolName,
-		CleanupState:      "none",
-		NetworkPolicy:     m.cfg.Network,
-		SecurityPolicy:    m.cfg.Security,
+		ID:                 id,
+		Mode:               mode,
+		ComposeProject:     composeProject,
+		ComposeFilePath:    composeFile,
+		CreatedAt:          now,
+		ExpiresAt:          now.Add(ttl),
+		Status:             StateCreated,
+		ScratchVolumeName:  scratchVolName,
+		CleanupState:       "none",
+		OutboundEnabled:    outboundEnabled,
+		HostGatewayEnabled: hostGatewayEnabled,
+		NetworkPolicy:      netPolicy,
+		SecurityPolicy:     m.cfg.Security,
 	}
 
 	m.sessions[id] = s

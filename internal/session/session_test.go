@@ -22,7 +22,7 @@ func TestSessionLifecycleV2(t *testing.T) {
 		t.Fatalf("failed to create session manager: %v", err)
 	}
 
-	s, err := mgr.CreateSession(ModePersistent, 60)
+	s, err := mgr.CreateSession(ModePersistent, 60, true, true)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}

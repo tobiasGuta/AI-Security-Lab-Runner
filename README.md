@@ -1,7 +1,7 @@
 # AI Security Lab Runner (lab-runner)
 
-[![CI](https://github.com/tobiasGuta/AI-Security-Lab-Runner-/actions/workflows/ci.yml/badge.svg)](https://github.com/tobiasGuta/AI-Security-Lab-Runner-/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/tobiasGuta/AI-Security-Lab-Runner/actions/workflows/ci.yml/badge.svg)](https://github.com/tobiasGuta/AI-Security-Lab-Runner/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.24-blue.svg)](https://go.dev)
 [![Docker](https://img.shields.io/badge/Docker-Required-blue.svg)](https://www.docker.com)
 

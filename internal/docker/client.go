@@ -108,9 +108,18 @@ func (c *CLIClient) ComposeUp(ctx context.Context, projectName, composeFilePath 
 }
 
 func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error {
-	stdout, _, exitCode, err := c.runDockerCmd(ctx, "ps", "-a", "--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID), "--format", "{{.ID}}")
+	if !strings.HasPrefix(projectName, "sandbox_") {
+		return fmt.Errorf("%w: invalid compose project prefix '%s', expected 'sandbox_'", ErrResourceMismatch, projectName)
+	}
+
+	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "ps", "-a",
+		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
+		"--filter", "label=ai.security.lab-runner.managed=true",
+		"--filter", "label=ai.security.lab-runner.kind=sandbox-runner",
+		"--format", "{{.ID}}",
+	)
 	if err != nil || exitCode != 0 || strings.TrimSpace(stdout) == "" {
-		return fmt.Errorf("%w: verified session label %s not found on active containers", ErrResourceMismatch, sessionID)
+		return fmt.Errorf("%w: verified session label %s not found on active containers (stderr: %s)", ErrResourceMismatch, sessionID, stderr)
 	}
 	return nil
 }
