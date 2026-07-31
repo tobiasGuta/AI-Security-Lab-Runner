@@ -1,18 +1,41 @@
-# Binaries
+# Compiled Executables & Binaries
 lab-runner
 lab-runner.exe
 *.exe
+*.exe~
 *.exe.test
 *.out
+*.test
+runner/sandbox-fs/sandbox-fs
+runner/sandbox-fs/sandbox-fs.exe
 
-# IDEs
+# Local Config Overrides & Secrets
+config.yaml
+config.local.yaml
+.env
+.env.*
+!.env.example
+
+# IDEs & Editor Files
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
+*.bak
 
-# Test & state artifacts
+# OS Metadata Files
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Test, Audit & State Artifacts
 .ai-security-lab-runner/
 audit.jsonl
 exports/
 sessions/
+*.log
+coverage.txt
+coverage.out
+profile.out
