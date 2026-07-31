@@ -3,6 +3,9 @@ package lab
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/audit"
 	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/config"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/docker"
 	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/session"
 )
 
@@ -71,7 +75,6 @@ func TestMCPOptionalFieldsInheritGlobalDefaults(t *testing.T) {
 		t.Fatalf("NewEngine failed: %v", err)
 	}
 
-	// Passing nil pointers should inherit global defaults
 	res, err := eng.StartSession(context.Background(), nil, nil, 30)
 	if err != nil {
 		t.Fatalf("StartSession with nil pointers failed: %v", err)
@@ -96,7 +99,6 @@ func TestCRLFHeaderInjectionRejection(t *testing.T) {
 		t.Fatalf("NewEngine failed: %v", err)
 	}
 
-	// Test CRLF in header name
 	_, err = eng.HTTPRequest(context.Background(), HTTPRequestOptions{
 		Method:  "GET",
 		URL:     "http://example.com/",
@@ -107,7 +109,7 @@ func TestCRLFHeaderInjectionRejection(t *testing.T) {
 	}
 }
 
-func TestAuditSecretLeakageScan(t *testing.T) {
+func TestAuditSecretAndPayloadLeakageScan(t *testing.T) {
 	tempState, err := os.MkdirTemp("", "adv_state_*")
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +130,11 @@ func TestAuditSecretLeakageScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rawSecret := "SECRET_TOKEN_SUPER_CONFIDENTIAL_123"
+	rawSecret := "SUPER_CONFIDENTIAL_BEARER_TOKEN_999"
+	b64Secret := base64.StdEncoding.EncodeToString([]byte(rawSecret))
+	hashSecret := sha256.Sum256([]byte(rawSecret))
+	hexSecret := hex.EncodeToString(hashSecret[:])
+
 	sess, err := eng.sessMgr.CreateSession(session.ModePersistent, 30, true, true)
 	if err != nil {
 		t.Fatal(err)
@@ -138,12 +144,12 @@ func TestAuditSecretLeakageScan(t *testing.T) {
 	// Write file with secret payload
 	_, _ = eng.WriteFile(context.Background(), sess.ID, "/scratch/secret.txt", rawSecret, "utf-8", true)
 
-	// Make HTTP request with secret header
+	// Make HTTP request with secret header & body
 	_, _ = eng.HTTPRequest(context.Background(), HTTPRequestOptions{
 		SessionID: sess.ID,
 		Method:    "POST",
 		URL:       "http://example.com/api",
-		Headers:   map[string]string{"Authorization": "Bearer " + rawSecret},
+		Headers:   map[string]string{"Authorization": "Bearer " + rawSecret, "Cookie": "session=" + rawSecret},
 		Body:      rawSecret,
 	})
 
@@ -158,7 +164,13 @@ func TestAuditSecretLeakageScan(t *testing.T) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.Contains(line, rawSecret) {
-			t.Errorf("SECURITY VIOLATION: unredacted secret found in audit log line: %s", line)
+			t.Errorf("SECURITY VIOLATION: raw secret found in audit log line: %s", line)
+		}
+		if strings.Contains(line, b64Secret) {
+			t.Errorf("SECURITY VIOLATION: base64 secret found in audit log line: %s", line)
+		}
+		if strings.Contains(line, hexSecret) && !strings.Contains(line, "content_sha256") && !strings.Contains(line, "body_sha256") {
+			t.Errorf("SECURITY VIOLATION: unexpected hex secret found in audit log line: %s", line)
 		}
 	}
 }
@@ -197,6 +209,9 @@ func TestTransactionalCleanupFailureRecovery(t *testing.T) {
 	if sess.Status != session.StateCleanupFailed {
 		t.Errorf("expected session status 'cleanup-failed', got '%s'", sess.Status)
 	}
+	if !sess.CleanupRetryable {
+		t.Errorf("expected cleanup_retryable to be true")
+	}
 
 	// ResetSession must immediately fail if StopSession fails
 	_, err = eng.ResetSession(context.Background(), startRes.SessionID)
@@ -205,13 +220,42 @@ func TestTransactionalCleanupFailureRecovery(t *testing.T) {
 	}
 }
 
+func TestStopVsExecRaceCondition(t *testing.T) {
+	tempState, err := os.MkdirTemp("", "adv_state_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempState)
+
+	cfg := config.DefaultConfig()
+	cfg.StateDir = tempState
+
+	eng, err := NewEngine(cfg, &MockDockerClient{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startRes, err := eng.StartSession(context.Background(), nil, nil, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Begin stopping session
+	_ = eng.sessMgr.BeginStopping(context.Background(), startRes.SessionID)
+
+	// Attempting Exec on stopping session MUST be rejected immediately
+	_, err = eng.Exec(context.Background(), startRes.SessionID, "echo test", "/scratch", 10, nil)
+	if err == nil || !strings.Contains(err.Error(), "execution lease denied") {
+		t.Errorf("expected execution lease denied error when session is stopping, got: %v", err)
+	}
+}
+
 type FailingDockerClient struct {
 	MockDockerClient
 	FailOwnership bool
-	FailDown      bool
 }
 
-func (f *FailingDockerClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error {
+func (f *FailingDockerClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string, snapshot docker.ResourceSnapshot) error {
 	if f.FailOwnership {
 		return session.ErrSessionNotFound
 	}

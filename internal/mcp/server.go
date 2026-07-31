@@ -202,6 +202,15 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		}
 		return s.engine.ReadFile(ctx, p.SessionID, p.Path, p.Offset, p.MaximumBytes, p.BinaryEncoding)
 
+	case "sandbox_export_file":
+		var p struct {
+			SessionID       string `json:"session_id"`
+			ScratchPath     string `json:"scratch_path"`
+			DestinationName string `json:"destination_name"`
+		}
+		_ = json.Unmarshal(args, &p)
+		return s.engine.ExportFile(ctx, p.SessionID, p.ScratchPath, p.DestinationName)
+
 	case "sandbox_status":
 		var p struct {
 			SessionID string `json:"session_id"`

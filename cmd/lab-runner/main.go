@@ -122,6 +122,8 @@ func cmdSandbox(args []string) {
 		cmdSandboxWrite(verbArgs)
 	case "read":
 		cmdSandboxRead(verbArgs)
+	case "export":
+		cmdSandboxExport(args[1:])
 	case "status":
 		cmdSandboxStatus(verbArgs)
 	case "stop":
@@ -439,6 +441,48 @@ func cmdSandboxRead(args []string) {
 	}
 
 	fmt.Print(res.Content)
+}
+
+func cmdSandboxExport(args []string) {
+	fs := flag.NewFlagSet("sandbox export", flag.ExitOnError)
+	dest := fs.String("dest", "", "Destination filename under export directory")
+	jsonMode := fs.Bool("json", false, "JSON output format")
+	configPath := fs.String("config", "", "Path to config file")
+	_ = fs.Parse(args)
+
+	positional := fs.Args()
+	if len(positional) < 2 {
+		output.PrintError(*jsonMode, "INVALID_ARGS", "Usage: lab-runner sandbox export <session-id> <scratch-path> [--dest <name>]")
+		os.Exit(1)
+	}
+
+	sessID := positional[0]
+	scratchPath := positional[1]
+
+	_, engine, err := loadEngine(*configPath)
+	if err != nil {
+		output.PrintError(*jsonMode, "CONFIG_ERROR", err.Error())
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+
+	res, err := engine.ExportFile(ctx, sessID, scratchPath, *dest)
+	if err != nil {
+		output.PrintError(*jsonMode, "EXPORT_FAILED", err.Error())
+		os.Exit(1)
+	}
+
+	if *jsonMode {
+		_ = output.PrintJSON(res)
+	} else {
+		if m, ok := res.(map[string]interface{}); ok {
+			fmt.Printf("Exported '%s' to '%s' (SHA256: %s, %v bytes)\n", m["source_path"], m["export_path"], m["sha256"], m["bytes"])
+		} else {
+			_ = output.PrintJSON(res)
+		}
+	}
 }
 
 func cmdSandboxStatus(args []string) {

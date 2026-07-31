@@ -2,10 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,7 +48,7 @@ type ResponseDoc struct {
 	BodyBase64             bool                `json:"body_base64"`
 	DurationMS             int64               `json:"duration_ms"`
 	RedirectChain          []string            `json:"redirect_chain"`
-	CurlExitCode           int                 `json:"curl_exit_code"`
+	ExitCode               int                 `json:"curl_exit_code"` // Kept JSON tag for backwards compatibility
 	ErrorCategory          string              `json:"error_category,omitempty"`
 	HostGatewayTranslation bool                `json:"host_gateway_translation"`
 	ConnectionHost         string              `json:"connection_host"`
@@ -64,13 +64,13 @@ func main() {
 
 	var spec RequestSpec
 	if err := json.Unmarshal(inputData, &spec); err != nil {
-		outputError("INVALID_JSON", fmt.Sprintf("Failed to parse JSON specification: %v", err))
+		outputError("INVALID_INPUT", fmt.Sprintf("Failed to parse JSON specification: %v", err))
 		return
 	}
 
 	doc, err := executeHTTPRequest(spec)
 	if err != nil {
-		outputError("EXECUTION_FAILED", err.Error())
+		outputError("INTERNAL_ERROR", err.Error())
 		return
 	}
 
@@ -117,38 +117,17 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 		return nil, fmt.Errorf("request body size %d exceeds limit 1MB", len(spec.Body))
 	}
 
-	hostname := parsedURL.Hostname()
-	port := parsedURL.Port()
-	if port == "" {
-		if parsedURL.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-
-	isLoopback := hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
-	connectionHost := hostname
-	gatewayTranslation := false
-
-	targetURL := spec.URL
-	originalHost := parsedURL.Host
-
-	if isLoopback {
-		connectionHost = spec.HostGatewayName
-		if connectionHost == "" {
-			connectionHost = "host.docker.internal"
-		}
-		gatewayTranslation = true
-		// Construct translated connect URL
-		parsedURL.Host = fmt.Sprintf("%s:%s", connectionHost, port)
-		targetURL = parsedURL.String()
-	}
-
 	// Jar setup
 	jar, _ := cookiejar.New(nil)
 	if spec.LoadCookiesPath != "" {
-		_ = loadCookies(jar, spec.LoadCookiesPath, parsedURL)
+		if err := loadCookies(jar, spec.LoadCookiesPath, parsedURL); err != nil {
+			return &ResponseDoc{
+				RequestedURL:  spec.URL,
+				ErrorCategory: "COOKIE_READ_FAILURE",
+				ExitCode:      1,
+				Body:          fmt.Sprintf("Failed to load cookies from '%s': %v", spec.LoadCookiesPath, err),
+			}, nil
+		}
 	}
 
 	timeoutSec := spec.TimeoutSeconds
@@ -157,14 +136,35 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 	}
 
 	var redirectChain []string
+	gatewayTranslation := false
+	connectionHost := parsedURL.Hostname()
+
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: spec.InsecureTLS,
+			ServerName:         parsedURL.Hostname(), // Preserve SNI
 		},
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, splitErr := net.SplitHostPort(addr)
+			if splitErr == nil && (host == "localhost" || host == "127.0.0.1" || host == "::1") {
+				if !spec.HostGatewayEnabled {
+					return nil, fmt.Errorf("POLICY_DENIED: host gateway translation is disabled for this session")
+				}
+				dialHost := spec.HostGatewayName
+				if dialHost == "" {
+					dialHost = "host.docker.internal"
+				}
+				addr = net.JoinHostPort(dialHost, port)
+				gatewayTranslation = true
+				connectionHost = dialHost
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
 	}
 
 	client := &http.Client{
@@ -176,20 +176,18 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 				return http.ErrUseLastResponse
 			}
 			if len(via) >= 10 {
-				return errors.New("stopped after 10 redirects")
+				return fmt.Errorf("stopped after 10 redirects")
 			}
 			redirectChain = append(redirectChain, req.URL.String())
 			return nil
 		},
 	}
 
-	req, err := http.NewRequest(method, targetURL, bytes.NewReader([]byte(spec.Body)))
+	// Preserve URL intact (no URL rewriting!)
+	req, err := http.NewRequest(method, spec.URL, bytes.NewReader([]byte(spec.Body)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
-
-	// Preserve Host header for host gateway translation
-	req.Host = originalHost
 
 	for k, v := range spec.Headers {
 		req.Header.Set(k, v)
@@ -210,7 +208,7 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 
 	if err != nil {
 		doc.ErrorCategory = classifyError(err)
-		doc.CurlExitCode = 1
+		doc.ExitCode = 1
 		doc.Body = fmt.Sprintf("HTTP Request Failed: %v", err)
 		return doc, nil
 	}
@@ -249,7 +247,14 @@ func executeHTTPRequest(spec RequestSpec) (*ResponseDoc, error) {
 	}
 
 	if spec.SaveCookiesPath != "" {
-		_ = saveCookies(jar, spec.SaveCookiesPath, parsedURL)
+		if err := saveCookies(jar, spec.SaveCookiesPath, parsedURL); err != nil {
+			return &ResponseDoc{
+				RequestedURL:  spec.URL,
+				ErrorCategory: "COOKIE_WRITE_FAILURE",
+				ExitCode:      1,
+				Body:          fmt.Sprintf("Failed to save cookies to '%s': %v", spec.SaveCookiesPath, err),
+			}, nil
+		}
 	}
 
 	return doc, nil
@@ -260,6 +265,22 @@ func loadCookies(jar http.CookieJar, cookiePath string, targetURL *url.URL) erro
 	if !strings.HasPrefix(clean, "/scratch") {
 		return fmt.Errorf("cookie path outside /scratch")
 	}
+
+	// Verify regular file & size limit
+	info, err := os.Lstat(clean)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("cookie path '%s' is not a regular file", clean)
+	}
+	if info.Size() > 1048576 {
+		return fmt.Errorf("cookie file exceeds size limit (1MB)")
+	}
+
 	data, err := os.ReadFile(clean)
 	if err != nil {
 		return err
@@ -276,22 +297,48 @@ func saveCookies(jar http.CookieJar, cookiePath string, targetURL *url.URL) erro
 	if !strings.HasPrefix(clean, "/scratch") {
 		return fmt.Errorf("cookie path outside /scratch")
 	}
+
 	cookies := jar.Cookies(targetURL)
 	data, err := json.Marshal(cookies)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(clean, data, 0600)
+
+	// Atomic save via temp file in /scratch
+	dir := filepath.Dir(clean)
+	tmpFile, err := os.CreateTemp(dir, ".tmp_cookie_*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	_ = tmpFile.Close()
+
+	return os.Rename(tmpName, clean)
 }
 
 func classifyError(err error) string {
 	if err == nil {
 		return ""
 	}
+	str := err.Error()
+	if strings.Contains(str, "POLICY_DENIED") {
+		return "POLICY_DENIED"
+	}
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		return "TIMEOUT"
 	}
-	str := err.Error()
 	if strings.Contains(str, "certificate") || strings.Contains(str, "tls") {
 		return "TLS_FAILURE"
 	}
@@ -314,7 +361,7 @@ func outputError(category, message string) {
 		ErrorCategory: category,
 		StatusCode:    0,
 		Body:          message,
-		CurlExitCode:  1,
+		ExitCode:      1,
 	}
 	outputJSON(doc)
 }

@@ -21,6 +21,7 @@ var (
 	ErrInvalidStateTransition = errors.New("invalid session state transition")
 	ErrSessionLimitReached    = errors.New("maximum active session limit reached")
 	ErrConcurrentExecLimit    = errors.New("concurrent command execution limit reached")
+	ErrSessionStopping        = errors.New("session is stopping or stopped, cannot execute command")
 )
 
 type Mode string
@@ -44,6 +45,15 @@ const (
 	StateExpired        State = "expired"
 )
 
+type CleanupSummary struct {
+	RunnerRemoved    bool   `json:"runner_removed"`
+	NetworkRemoved   bool   `json:"network_removed"`
+	ScratchRemoved   bool   `json:"scratch_removed"`
+	StateRemoved     bool   `json:"state_removed"`
+	CleanupError     string `json:"cleanup_error,omitempty"`
+	CleanupRetryable bool   `json:"cleanup_retryable"`
+}
+
 type Session struct {
 	ID                 string                `json:"session_id"`
 	Mode               Mode                  `json:"mode"`
@@ -60,6 +70,8 @@ type Session struct {
 	CleanupState       string                `json:"cleanup_state"`
 	CleanupError       string                `json:"cleanup_error,omitempty"`
 	CleanupTimestamp   string                `json:"cleanup_timestamp,omitempty"`
+	CleanupRetryable   bool                  `json:"cleanup_retryable"`
+	Cleanup            CleanupSummary        `json:"cleanup_summary"`
 	OutboundEnabled    bool                  `json:"outbound_enabled"`
 	HostGatewayEnabled bool                  `json:"host_gateway_enabled"`
 	NetworkPolicy      config.NetworkConfig  `json:"network_policy"`
@@ -168,6 +180,7 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, host
 		ScratchVolumeName:  scratchVolName,
 		VolumeName:         scratchVolName,
 		CleanupState:       "none",
+		CleanupRetryable:   true,
 		OutboundEnabled:    outboundEnabled,
 		HostGatewayEnabled: hostGatewayEnabled,
 		NetworkPolicy:      netPolicy,
@@ -186,9 +199,20 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, host
 	return s, nil
 }
 
-// AcquireExecSemaphores acquires both global and per-session execution slots atomically with context cancellation.
-func (m *Manager) AcquireExecSemaphores(ctx context.Context, id string) (func(), error) {
+// AcquireExecLease acquires execution lease and semaphores cleanly. Rejects if session is stopping or not ready.
+func (m *Manager) AcquireExecLease(ctx context.Context, id string) (func(), error) {
 	m.mu.Lock()
+	sess, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
+	}
+
+	if sess.Status != StateReady && sess.Status != StateRunningCommand {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: session '%s' is in state '%s'", ErrSessionStopping, id, sess.Status)
+	}
+
 	sessSem, ok := m.sessionSems[id]
 	if !ok {
 		sessLimit := m.cfg.Limits.MaximumParallelExecPerSession
@@ -198,12 +222,16 @@ func (m *Manager) AcquireExecSemaphores(ctx context.Context, id string) (func(),
 		sessSem = make(chan struct{}, sessLimit)
 		m.sessionSems[id] = sessSem
 	}
+
+	sess.ActiveExecCount++
+	_ = m.saveSessionLocked(sess)
 	m.mu.Unlock()
 
 	// Acquire global semaphore
 	select {
 	case m.globalSem <- struct{}{}:
 	case <-ctx.Done():
+		m.decrementExecCount(id)
 		return nil, ctx.Err()
 	}
 
@@ -212,6 +240,7 @@ func (m *Manager) AcquireExecSemaphores(ctx context.Context, id string) (func(),
 	case sessSem <- struct{}{}:
 	case <-ctx.Done():
 		<-m.globalSem
+		m.decrementExecCount(id)
 		return nil, ctx.Err()
 	}
 
@@ -220,10 +249,57 @@ func (m *Manager) AcquireExecSemaphores(ctx context.Context, id string) (func(),
 		once.Do(func() {
 			<-sessSem
 			<-m.globalSem
+			m.decrementExecCount(id)
 		})
 	}
 
 	return release, nil
+}
+
+func (m *Manager) decrementExecCount(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sess, ok := m.sessions[id]; ok {
+		sess.ActiveExecCount--
+		if sess.ActiveExecCount < 0 {
+			sess.ActiveExecCount = 0
+		}
+		_ = m.saveSessionLocked(sess)
+	}
+}
+
+// BeginStopping transitions session status to StateStopping and waits for active execs to complete.
+func (m *Manager) BeginStopping(ctx context.Context, id string) error {
+	m.mu.Lock()
+	sess, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
+	}
+
+	sess.Status = StateStopping
+	_ = m.saveSessionLocked(sess)
+	m.mu.Unlock()
+
+	// Wait for active executions to reach zero
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		m.mu.Lock()
+		active := sess.ActiveExecCount
+		m.mu.Unlock()
+
+		if active == 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *Manager) GetSession(id string) (*Session, error) {
@@ -240,7 +316,6 @@ func (m *Manager) GetSession(id string) (*Session, error) {
 		_ = m.saveSessionLocked(s)
 	}
 
-	// Return defensive copy
 	cp := *s
 	return &cp, nil
 }
@@ -291,29 +366,18 @@ func (m *Manager) Transition(id string, from, to State) error {
 	return m.saveSessionLocked(s)
 }
 
-func (m *Manager) SetActiveExecCount(id string, delta int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[id]
-	if !ok {
-		return fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
-	}
-
-	s.ActiveExecCount += delta
-	if s.ActiveExecCount < 0 {
-		s.ActiveExecCount = 0
-	}
-	return m.saveSessionLocked(s)
-}
-
-// RemoveSession is transactional: returns error if state dir deletion fails and keeps in-memory state.
+// RemoveSession is transactional: returns error if active executions exist or state dir deletion fails.
 func (m *Manager) RemoveSession(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.sessions[id]; !ok {
+	sess, ok := m.sessions[id]
+	if !ok {
 		return nil
+	}
+
+	if sess.ActiveExecCount > 0 {
+		return fmt.Errorf("cannot remove session %s while %d active executions exist", id, sess.ActiveExecCount)
 	}
 
 	sessDir := filepath.Join(m.stateDir, id)

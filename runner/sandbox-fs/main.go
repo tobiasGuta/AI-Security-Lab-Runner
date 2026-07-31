@@ -66,12 +66,12 @@ func cmdRead(args []string) {
 	var maxBytes int64 = 2097152
 
 	if len(args) >= 2 {
-		if val, err := strconv.ParseInt(args[1], 10, 64); err == nil {
+		if val, err := strconv.ParseInt(args[1], 10, 64); err == nil && val >= 0 {
 			offset = val
 		}
 	}
 	if len(args) >= 3 {
-		if val, err := strconv.ParseInt(args[2], 10, 64); err == nil {
+		if val, err := strconv.ParseInt(args[2], 10, 64); err == nil && val > 0 {
 			maxBytes = val
 		}
 	}
@@ -108,9 +108,8 @@ func cmdWrite(args []string) {
 		os.Exit(2)
 	}
 
-	// Create intermediate parent directories descriptor-relatively using mkdirat
 	if err := mkdiratScratchPath(cleaned); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create parent directories descriptor-relatively: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to create parent directories: %v\n", err)
 		os.Exit(1)
 	}
 

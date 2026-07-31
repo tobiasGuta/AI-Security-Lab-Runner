@@ -26,7 +26,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_start",
-			Description: "Start a persistent sandbox session with outbound network access and host-gateway support.",
+			Description: "Start a persistent sandbox session with outbound network access and host-gateway translation.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -36,7 +36,7 @@ func GetDefinedTools() []Tool {
 					},
 					"host_access": {
 						Type:        "boolean",
-						Description: "Enable host gateway mapping for accessing host-published applications (optional pointer; true subject to global policy ceiling).",
+						Description: "Enable automatic localhost/127.0.0.1 loopback translation to host gateway (optional pointer; true subject to global policy ceiling).",
 					},
 					"ttl_minutes": {
 						Type:        "integer",
@@ -73,7 +73,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_http_request",
-			Description: "Make a structured HTTP/HTTPS request inside the sandbox using trusted sandbox-http helper. Loopback URLs (localhost/127.0.0.1) automatically map to host-published services.",
+			Description: "Make a structured HTTP/HTTPS request inside the sandbox using trusted sandbox-http helper. Loopback URLs (localhost/127.0.0.1) translate to host gateway when enabled.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -174,6 +174,28 @@ func GetDefinedTools() []Tool {
 			},
 		},
 		{
+			Name:        "sandbox_export_file",
+			Description: "Export a file strictly under /scratch to the configured host export directory.",
+			InputSchema: ToolSchema{
+				Type: "object",
+				Properties: map[string]SchemaProperty{
+					"session_id": {
+						Type:        "string",
+						Description: "Active sandbox session ID.",
+					},
+					"scratch_path": {
+						Type:        "string",
+						Description: "Container file path strictly under /scratch.",
+					},
+					"destination_name": {
+						Type:        "string",
+						Description: "Optional destination filename under export directory.",
+					},
+				},
+				Required: []string{"session_id", "scratch_path"},
+			},
+		},
+		{
 			Name:        "sandbox_status",
 			Description: "Show active sandbox sessions and status metadata.",
 			InputSchema: ToolSchema{
@@ -195,10 +217,6 @@ func GetDefinedTools() []Tool {
 					"session_id": {
 						Type:        "string",
 						Description: "Session ID to stop.",
-					},
-					"preserve_scratch": {
-						Type:        "boolean",
-						Description: "Preserve scratch volume if global policy allows.",
 					},
 				},
 				Required: []string{"session_id"},

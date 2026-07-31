@@ -18,18 +18,26 @@ var (
 	ErrResourceMismatch  = errors.New("resource ownership mismatch")
 )
 
+type ResourceSnapshot struct {
+	RunnerContainerID string `json:"runner_container_id"`
+	NetworkID         string `json:"network_id"`
+	ScratchVolumeName string `json:"scratch_volume_name"`
+}
+
 type Client interface {
 	CheckDockerAvailable(ctx context.Context) error
 	CheckComposeAvailable(ctx context.Context) error
 	CheckLinuxContainers(ctx context.Context) error
 	BuildImage(ctx context.Context, dockerfilePath, imageTag string) error
-	ComposeUp(ctx context.Context, projectName, composeFilePath string) error
+	ComposeUp(ctx context.Context, projectName, composeFilePath string) (ResourceSnapshot, error)
 	ComposeDown(ctx context.Context, projectName, composeFilePath string) error
 	ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
 	ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
+	ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
 	CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error
 	ListManagedResources(ctx context.Context) ([]string, error)
-	VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error
+	VerifyResourceOwnership(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) error
+	VerifyResourcesAbsent(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) (runnerRemoved, networkRemoved, scratchRemoved bool, err error)
 }
 
 type CLIClient struct {
@@ -100,28 +108,51 @@ func (c *CLIClient) BuildImage(ctx context.Context, dockerfilePath, imageTag str
 	return nil
 }
 
-func (c *CLIClient) ComposeUp(ctx context.Context, projectName, composeFilePath string) error {
+func (c *CLIClient) ComposeUp(ctx context.Context, projectName, composeFilePath string) (ResourceSnapshot, error) {
+	var snap ResourceSnapshot
 	_, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "up", "-d")
 	if err != nil || exitCode != 0 {
-		return fmt.Errorf("%w: docker compose up failed (exit code %d): %s", ErrDockerExecFailed, exitCode, stderr)
+		return snap, fmt.Errorf("%w: docker compose up failed (exit code %d): %s", ErrDockerExecFailed, exitCode, stderr)
 	}
-	return nil
+
+	// Inspect exact runner container ID
+	cOut, _, _, _ := c.runDockerCmd(ctx, "compose", "-p", projectName, "ps", "-q", "runner")
+	snap.RunnerContainerID = strings.TrimSpace(cOut)
+
+	// Inspect exact network ID
+	nOut, _, _, _ := c.runDockerCmd(ctx, "network", "ls", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName), "--format", "{{.ID}}")
+	snap.NetworkID = strings.TrimSpace(nOut)
+
+	// Inspect exact volume name
+	vOut, _, _, _ := c.runDockerCmd(ctx, "volume", "ls", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName), "--format", "{{.Name}}")
+	snap.ScratchVolumeName = strings.TrimSpace(vOut)
+
+	return snap, nil
 }
 
-func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error {
+func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) error {
 	if !strings.HasPrefix(projectName, "sandbox_") {
 		return fmt.Errorf("%w: invalid compose project prefix '%s', expected 'sandbox_'", ErrResourceMismatch, projectName)
 	}
 
-	// Verify Runner Container
+	// Verify Runner Container: exactly 1 match, exact container ID, managed=true, kind=sandbox-runner
 	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "ps", "-a",
 		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
 		"--filter", "label=ai.security.lab-runner.managed=true",
 		"--filter", "label=ai.security.lab-runner.kind=sandbox-runner",
+		"--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName),
 		"--format", "{{.ID}}",
 	)
-	if err != nil || exitCode != 0 || strings.TrimSpace(stdout) == "" {
-		return fmt.Errorf("%w: verified session container label %s not found on active containers (stderr: %s)", ErrResourceMismatch, sessionID, stderr)
+	if err != nil || exitCode != 0 {
+		return fmt.Errorf("%w: container verification command failed: %s", ErrResourceMismatch, stderr)
+	}
+
+	cIDs := strings.Fields(strings.TrimSpace(stdout))
+	if len(cIDs) != 1 {
+		return fmt.Errorf("%w: expected exactly 1 runner container for session %s, found %d", ErrResourceMismatch, sessionID, len(cIDs))
+	}
+	if snapshot.RunnerContainerID != "" && !strings.HasPrefix(cIDs[0], snapshot.RunnerContainerID) && !strings.HasPrefix(snapshot.RunnerContainerID, cIDs[0]) {
+		return fmt.Errorf("%w: container ID mismatch: expected %s, found %s", ErrResourceMismatch, snapshot.RunnerContainerID, cIDs[0])
 	}
 
 	// Verify Network
@@ -129,6 +160,7 @@ func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, se
 		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
 		"--filter", "label=ai.security.lab-runner.managed=true",
 		"--filter", "label=ai.security.lab-runner.kind=sandbox-network",
+		"--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName),
 		"--format", "{{.ID}}",
 	)
 	if errNet != nil || exitCodeNet != 0 || strings.TrimSpace(stdoutNet) == "" {
@@ -140,6 +172,7 @@ func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, se
 		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
 		"--filter", "label=ai.security.lab-runner.managed=true",
 		"--filter", "label=ai.security.lab-runner.kind=sandbox-scratch",
+		"--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName),
 		"--format", "{{.Name}}",
 	)
 	if errVol != nil || exitCodeVol != 0 || strings.TrimSpace(stdoutVol) == "" {
@@ -149,20 +182,31 @@ func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, se
 	return nil
 }
 
+func (c *CLIClient) VerifyResourcesAbsent(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) (runnerRemoved, networkRemoved, scratchRemoved bool, err error) {
+	cOut, _, _, _ := c.runDockerCmd(ctx, "ps", "-a", "--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID), "--format", "{{.ID}}")
+	runnerRemoved = strings.TrimSpace(cOut) == ""
+
+	nOut, _, _, _ := c.runDockerCmd(ctx, "network", "ls", "--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID), "--format", "{{.ID}}")
+	networkRemoved = strings.TrimSpace(nOut) == ""
+
+	vOut, _, _, _ := c.runDockerCmd(ctx, "volume", "ls", "--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID), "--format", "{{.Name}}")
+	scratchRemoved = strings.TrimSpace(vOut) == ""
+
+	return runnerRemoved, networkRemoved, scratchRemoved, nil
+}
+
 func (c *CLIClient) ComposeDown(ctx context.Context, projectName, composeFilePath string) error {
 	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "down", "-v", "--remove-orphans")
 	if err != nil || exitCode != 0 {
-		// Verify if containers are actually gone
 		psOut, _, _, _ := c.runDockerCmd(ctx, "ps", "-a", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName), "--format", "{{.ID}}")
 		if strings.TrimSpace(psOut) == "" {
-			return nil // Resources successfully removed despite compose warning
+			return nil
 		}
 		return fmt.Errorf("%w: docker compose down failed (exit code %d): %s (stdout: %s)", ErrDockerExecFailed, exitCode, stderr, stdout)
 	}
 	return nil
 }
 
-// ExecInRunner executes an agent command string inside the runner container using Docker CLI argument arrays without shell interpolation on host.
 func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, agentCmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
 	timeoutSec := int(timeout.Seconds())
 	if timeoutSec <= 0 {
@@ -174,11 +218,14 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 		"bash", "-lc", agentCmd,
 	}
 
-	return c.ExecArgvInRunner(ctx, projectName, composeFilePath, cwd, argv, env, timeout, maxOutputBytes)
+	return c.ExecArgvWithInputInRunner(ctx, projectName, composeFilePath, cwd, argv, nil, env, timeout, maxOutputBytes)
 }
 
-// ExecArgvInRunner executes a raw string slice argument vector directly inside the runner container.
 func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
+	return c.ExecArgvWithInputInRunner(ctx, projectName, composeFilePath, cwd, argv, nil, env, timeout, maxOutputBytes)
+}
+
+func (c *CLIClient) ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
 	hostTimeout := timeout + 5*time.Second
 	if timeout <= 0 {
 		hostTimeout = 35 * time.Second
@@ -189,8 +236,14 @@ func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFi
 
 	args := []string{
 		"compose", "-p", projectName, "-f", composeFilePath,
-		"exec", "-T", "--workdir", cwd,
+		"exec", "-T",
 	}
+
+	if len(stdin) > 0 {
+		args = append(args, "-i")
+	}
+
+	args = append(args, "--workdir", cwd)
 
 	for k, v := range env {
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
@@ -200,6 +253,10 @@ func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFi
 	args = append(args, argv...)
 
 	cmd := exec.CommandContext(execCtx, c.dockerBin, args...)
+
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 
 	stdoutWriter := output.NewBoundedWriter(maxOutputBytes)
 	stderrWriter := output.NewBoundedWriter(maxOutputBytes)

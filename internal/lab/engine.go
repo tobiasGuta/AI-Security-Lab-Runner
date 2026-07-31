@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,23 +53,17 @@ func NewEngine(cfg *config.Config, dockerClient docker.Client, auditLogger *audi
 	}, nil
 }
 
-type CleanupSummary struct {
-	RunnerRemoved  bool `json:"runner_removed"`
-	ScratchRemoved bool `json:"scratch_removed"`
-	NetworkRemoved bool `json:"network_removed"`
-}
-
 type RunResult struct {
-	SessionID       string         `json:"session_id"`
-	Ephemeral       bool           `json:"ephemeral"`
-	ExitCode        int            `json:"exit_code"`
-	TimedOut        bool           `json:"timed_out"`
-	DurationMS      int64          `json:"duration_ms"`
-	Stdout          string         `json:"stdout"`
-	Stderr          string         `json:"stderr"`
-	StdoutTruncated bool           `json:"stdout_truncated"`
-	StderrTruncated bool           `json:"stderr_truncated"`
-	Cleanup         CleanupSummary `json:"cleanup"`
+	SessionID       string                 `json:"session_id"`
+	Ephemeral       bool                   `json:"ephemeral"`
+	ExitCode        int                    `json:"exit_code"`
+	TimedOut        bool                   `json:"timed_out"`
+	DurationMS      int64                  `json:"duration_ms"`
+	Stdout          string                 `json:"stdout"`
+	Stderr          string                 `json:"stderr"`
+	StdoutTruncated bool                   `json:"stdout_truncated"`
+	StderrTruncated bool                   `json:"stderr_truncated"`
+	Cleanup         session.CleanupSummary `json:"cleanup"`
 }
 
 func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, env map[string]string) (*RunResult, error) {
@@ -84,20 +79,9 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 		Ephemeral: true,
 	}
 
-	// Defer verified auto-cleanup using independent bounded context
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.cfg.Limits.ShutdownGraceSeconds)*time.Second)
-		defer cancel()
-
-		downErr := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath)
-		removeErr := e.sessMgr.RemoveSession(sess.ID)
-
-		success := downErr == nil && removeErr == nil
-		res.Cleanup = CleanupSummary{
-			RunnerRemoved:  success,
-			ScratchRemoved: success,
-			NetworkRemoved: success,
-		}
+		summary, _ := e.cleanupSession(context.Background(), sess.ID)
+		res.Cleanup = summary
 	}()
 
 	_ = e.sessMgr.Transition(sess.ID, session.StateCreated, session.StateStarting)
@@ -111,11 +95,17 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 		return res, fmt.Errorf("failed to write compose file: %w", err)
 	}
 
-	if err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
+	snap, err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath)
+	if err != nil {
 		return res, fmt.Errorf("failed to bring up runner container: %w", err)
 	}
 
-	_ = e.sessMgr.Transition(sess.ID, session.StateStarting, session.StateReady)
+	_ = e.sessMgr.UpdateSessionState(sess.ID, func(s *session.Session) {
+		s.RunnerContainerID = snap.RunnerContainerID
+		s.NetworkID = snap.NetworkID
+		s.VolumeName = snap.ScratchVolumeName
+		s.Status = session.StateReady
+	})
 
 	if cwd == "" {
 		cwd = "/scratch"
@@ -181,7 +171,7 @@ func (e *Engine) StartSession(ctx context.Context, reqOutbound, reqHostAccess *b
 	if err != nil {
 		return nil, err
 	}
-	effectiveHostAccess, err := e.resolveNetworkPolicy(reqHostAccess, e.cfg.Network.HostGatewayEnabled, "host_access")
+	effectiveHostAccess, err := e.resolveNetworkPolicy(reqHostAccess, e.cfg.Network.HostGatewayEnabled, "host_gateway_translation")
 	if err != nil {
 		return nil, err
 	}
@@ -195,22 +185,27 @@ func (e *Engine) StartSession(ctx context.Context, reqOutbound, reqHostAccess *b
 
 	composeContent, err := docker.GenerateComposeYAML(sess.ID, sess.OutboundEnabled, sess.HostGatewayEnabled, e.cfg)
 	if err != nil {
-		_ = e.sessMgr.RemoveSession(sess.ID)
+		_, _ = e.cleanupSession(context.Background(), sess.ID)
 		return nil, fmt.Errorf("failed to generate compose yaml: %w", err)
 	}
 
 	if err := os.WriteFile(sess.ComposeFilePath, []byte(composeContent), 0600); err != nil {
-		_ = e.sessMgr.RemoveSession(sess.ID)
+		_, _ = e.cleanupSession(context.Background(), sess.ID)
 		return nil, fmt.Errorf("failed to write compose file: %w", err)
 	}
 
-	if err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
-		_ = e.dockerClient.ComposeDown(ctx, sess.ComposeProject, sess.ComposeFilePath)
-		_ = e.sessMgr.RemoveSession(sess.ID)
+	snap, err := e.dockerClient.ComposeUp(ctx, sess.ComposeProject, sess.ComposeFilePath)
+	if err != nil {
+		_, _ = e.cleanupSession(context.Background(), sess.ID)
 		return nil, fmt.Errorf("docker compose up failed: %w", err)
 	}
 
-	_ = e.sessMgr.Transition(sess.ID, session.StateStarting, session.StateReady)
+	_ = e.sessMgr.UpdateSessionState(sess.ID, func(s *session.Session) {
+		s.RunnerContainerID = snap.RunnerContainerID
+		s.NetworkID = snap.NetworkID
+		s.VolumeName = snap.ScratchVolumeName
+		s.Status = session.StateReady
+	})
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
@@ -251,15 +246,6 @@ type ExecResult struct {
 func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutSec int, env map[string]string) (*ExecResult, error) {
 	timeoutSec = e.clampTimeout(timeoutSec)
 
-	sess, err := e.sessMgr.GetSession(sessID)
-	if err != nil {
-		return nil, err
-	}
-
-	if sess.Status != session.StateReady && sess.Status != session.StateRunningCommand {
-		return nil, fmt.Errorf("session %s is in state '%s', cannot execute command", sessID, sess.Status)
-	}
-
 	if cwd == "" {
 		cwd = "/scratch"
 	}
@@ -268,14 +254,16 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 		return nil, fmt.Errorf("invalid execution working directory: %w", err)
 	}
 
-	releaseSem, err := e.sessMgr.AcquireExecSemaphores(ctx, sessID)
+	releaseLease, err := e.sessMgr.AcquireExecLease(ctx, sessID)
 	if err != nil {
-		return nil, fmt.Errorf("concurrency limit exceeded: %w", err)
+		return nil, fmt.Errorf("execution lease denied: %w", err)
 	}
-	defer releaseSem()
+	defer releaseLease()
 
-	_ = e.sessMgr.SetActiveExecCount(sessID, 1)
-	defer func() { _ = e.sessMgr.SetActiveExecCount(sessID, -1) }()
+	sess, err := e.sessMgr.GetSession(sessID)
+	if err != nil {
+		return nil, err
+	}
 
 	timeout := time.Duration(timeoutSec) * time.Second
 
@@ -322,6 +310,100 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 	}, nil
 }
 
+// execInternalArgv executes raw argv + stdin without command string audit logging or base64 shell expansion.
+func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []string, stdin []byte, timeoutSec int) (*ExecResult, error) {
+	timeoutSec = e.clampTimeout(timeoutSec)
+
+	var sess *session.Session
+	var err error
+	var releaseLease func()
+
+	if sessID != "" {
+		releaseLease, err = e.sessMgr.AcquireExecLease(ctx, sessID)
+		if err != nil {
+			return nil, fmt.Errorf("internal execution lease denied: %w", err)
+		}
+		defer releaseLease()
+
+		sess, err = e.sessMgr.GetSession(sessID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	timeout := time.Duration(timeoutSec) * time.Second
+
+	start := time.Now()
+	var exitCode int
+	var stdout, stderr string
+	var timedOut, truncated bool
+
+	if sess != nil {
+		exitCode, stdout, stderr, timedOut, truncated, err = e.dockerClient.ExecArgvWithInputInRunner(
+			ctx,
+			sess.ComposeProject,
+			sess.ComposeFilePath,
+			"/scratch",
+			argv,
+			stdin,
+			nil,
+			timeout,
+			e.cfg.Limits.MaximumOutputBytes,
+		)
+	} else {
+		// Ephemeral execution path
+		ephSess, createErr := e.sessMgr.CreateSession(session.ModeEphemeral, 15, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled)
+		if createErr != nil {
+			return nil, fmt.Errorf("failed to create ephemeral session: %w", createErr)
+		}
+		defer func() {
+			_, _ = e.cleanupSession(context.Background(), ephSess.ID)
+		}()
+
+		composeContent, _ := docker.GenerateComposeYAML(ephSess.ID, ephSess.OutboundEnabled, ephSess.HostGatewayEnabled, e.cfg)
+		_ = os.WriteFile(ephSess.ComposeFilePath, []byte(composeContent), 0600)
+		snap, upErr := e.dockerClient.ComposeUp(ctx, ephSess.ComposeProject, ephSess.ComposeFilePath)
+		if upErr != nil {
+			return nil, fmt.Errorf("ephemeral compose up failed: %w", upErr)
+		}
+		_ = e.sessMgr.UpdateSessionState(ephSess.ID, func(s *session.Session) {
+			s.RunnerContainerID = snap.RunnerContainerID
+			s.NetworkID = snap.NetworkID
+			s.VolumeName = snap.ScratchVolumeName
+			s.Status = session.StateReady
+		})
+
+		exitCode, stdout, stderr, timedOut, truncated, err = e.dockerClient.ExecArgvWithInputInRunner(
+			ctx,
+			ephSess.ComposeProject,
+			ephSess.ComposeFilePath,
+			"/scratch",
+			argv,
+			stdin,
+			nil,
+			timeout,
+			e.cfg.Limits.MaximumOutputBytes,
+		)
+	}
+
+	duration := time.Since(start).Milliseconds()
+
+	if err != nil {
+		return nil, fmt.Errorf("internal argv execution failed: %w", err)
+	}
+
+	return &ExecResult{
+		SessionID:       sessID,
+		ExitCode:        exitCode,
+		TimedOut:        timedOut,
+		DurationMS:      duration,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		StdoutTruncated: truncated,
+		StderrTruncated: truncated,
+	}, nil
+}
+
 type HTTPRequestOptions struct {
 	SessionID       string            `json:"session_id,omitempty"`
 	Method          string            `json:"method"`
@@ -341,16 +423,16 @@ type HTTPRequestResult struct {
 	StatusCode             int                 `json:"status_code"`
 	Headers                map[string][]string `json:"headers"`
 	Body                   string              `json:"body"`
+	BodyBase64             bool                `json:"body_base64"`
 	DurationMS             int64               `json:"duration_ms"`
 	RedirectChain          []string            `json:"redirect_chain"`
-	CurlExitCode           int                 `json:"curl_exit_code"`
+	ExitCode               int                 `json:"curl_exit_code"` // Kept JSON tag for backward compatibility
 	ErrorCategory          string              `json:"error_category,omitempty"`
 	HostGatewayTranslation bool                `json:"host_gateway_translation"`
 	ConnectionHost         string              `json:"connection_host"`
 	Truncated              bool                `json:"truncated"`
 }
 
-// HTTPRequest executes a structured HTTP request using the trusted compiled sandbox-http Go helper binary.
 func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTTPRequestResult, error) {
 	if opts.URL == "" {
 		return nil, fmt.Errorf("URL cannot be empty")
@@ -372,6 +454,13 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		}
 	}
 
+	hostGatewayEnabled := e.cfg.Network.HostGatewayEnabled
+	if opts.SessionID != "" {
+		if sess, err := e.sessMgr.GetSession(opts.SessionID); err == nil {
+			hostGatewayEnabled = sess.HostGatewayEnabled
+		}
+	}
+
 	specObj := map[string]interface{}{
 		"method":               opts.Method,
 		"url":                  opts.URL,
@@ -383,7 +472,7 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		"save_cookies_path":    opts.SaveCookiesPath,
 		"load_cookies_path":    opts.LoadCookiesPath,
 		"host_gateway_name":    e.cfg.Network.HostGatewayName,
-		"host_gateway_enabled": e.cfg.Network.HostGatewayEnabled,
+		"host_gateway_enabled": hostGatewayEnabled,
 		"max_response_bytes":   e.cfg.Limits.MaximumReadBytes,
 	}
 
@@ -392,29 +481,8 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		return nil, fmt.Errorf("failed to serialize HTTP request specification: %w", err)
 	}
 
-	specB64 := base64.StdEncoding.EncodeToString(specData)
-	execCmd := fmt.Sprintf("echo '%s' | base64 -d | /usr/local/bin/sandbox-http", specB64)
-
-	var execRes *ExecResult
-	if opts.SessionID != "" {
-		execRes, err = e.Exec(ctx, opts.SessionID, execCmd, "/scratch", opts.TimeoutSeconds, nil)
-	} else {
-		runRes, err := e.Run(ctx, execCmd, "/scratch", opts.TimeoutSeconds, nil)
-		if err == nil {
-			execRes = &ExecResult{
-				SessionID:       runRes.SessionID,
-				ExitCode:        runRes.ExitCode,
-				TimedOut:        runRes.TimedOut,
-				DurationMS:      runRes.DurationMS,
-				Stdout:          runRes.Stdout,
-				Stderr:          runRes.Stderr,
-				StdoutTruncated: runRes.StdoutTruncated,
-			}
-		} else {
-			return nil, err
-		}
-	}
-
+	argv := []string{"/usr/local/bin/sandbox-http"}
+	execRes, err := e.execInternalArgv(ctx, opts.SessionID, argv, specData, opts.TimeoutSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +507,7 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 			ToolOrCommand: "sandbox_http_request",
 			AuditMode:     audit.AuditMetadataOnly,
 			DurationMS:    execRes.DurationMS,
-			ExitCode:      &resDoc.CurlExitCode,
+			ExitCode:      &resDoc.ExitCode,
 			Details: map[string]interface{}{
 				"method":      opts.Method,
 				"url":         sanitizedURL,
@@ -467,22 +535,47 @@ func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, off
 		return nil, fmt.Errorf("%w: %v", ErrInvalidScratchPath, err)
 	}
 
-	if maxBytes <= 0 {
+	if offset < 0 {
+		return nil, fmt.Errorf("invalid offset %d (must be >= 0)", offset)
+	}
+
+	if maxBytes <= 0 || maxBytes > e.cfg.Limits.MaximumReadBytes {
 		maxBytes = e.cfg.Limits.MaximumReadBytes
 	}
 
-	cmd := fmt.Sprintf("/usr/local/bin/sandbox-fs read '%s' %d %d", cleanPath, offset, maxBytes)
-	res, err := e.Exec(ctx, sessID, cmd, "/scratch", 15, nil)
+	if binaryEncoding == "" {
+		binaryEncoding = "utf-8"
+	}
+	if binaryEncoding != "utf-8" && binaryEncoding != "base64" {
+		return nil, fmt.Errorf("unsupported binary_encoding '%s' (must be 'utf-8' or 'base64')", binaryEncoding)
+	}
+
+	// Direct argv execution via sandbox-fs stat first to check file size
+	statArgv := []string{"/usr/local/bin/sandbox-fs", "stat", cleanPath}
+	statRes, err := e.execInternalArgv(ctx, sessID, statArgv, nil, 10)
+	if err != nil || statRes.ExitCode != 0 {
+		return nil, fmt.Errorf("sandbox-fs stat failed for '%s': %s", cleanPath, statRes.Stderr)
+	}
+
+	var statObj map[string]interface{}
+	_ = json.Unmarshal([]byte(strings.TrimSpace(statRes.Stdout)), &statObj)
+	totalFileSize := int64(0)
+	if sizeVal, ok := statObj["size"].(float64); ok {
+		totalFileSize = int64(sizeVal)
+	}
+
+	readArgv := []string{"/usr/local/bin/sandbox-fs", "read", cleanPath, strconv.FormatInt(offset, 10), strconv.FormatInt(maxBytes, 10)}
+	res, err := e.execInternalArgv(ctx, sessID, readArgv, nil, 15)
 	if err != nil || res.ExitCode != 0 {
 		return nil, fmt.Errorf("sandbox-fs read failed for '%s': exit code %d, stderr: %s", cleanPath, res.ExitCode, res.Stderr)
 	}
 
 	content := res.Stdout
-	encoding := "utf-8"
 	if binaryEncoding == "base64" {
 		content = base64.StdEncoding.EncodeToString([]byte(res.Stdout))
-		encoding = "base64"
 	}
+
+	isTruncated := (offset + int64(len(res.Stdout))) < totalFileSize
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
@@ -502,8 +595,8 @@ func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, off
 		SessionID: sessID,
 		Path:      cleanPath,
 		Content:   content,
-		Encoding:  encoding,
-		Truncated: res.StdoutTruncated,
+		Encoding:  binaryEncoding,
+		Truncated: isTruncated,
 	}, nil
 }
 
@@ -523,14 +616,14 @@ func (e *Engine) WriteFile(ctx context.Context, sessID, scratchPath, content, en
 		return nil, fmt.Errorf("content size %d exceeds write limit %d", len(content), e.cfg.Limits.MaximumWriteBytes)
 	}
 
-	b64Data := base64.StdEncoding.EncodeToString([]byte(content))
 	overwriteStr := "false"
 	if overwrite {
 		overwriteStr = "true"
 	}
 
-	cmd := fmt.Sprintf("echo '%s' | base64 -d | /usr/local/bin/sandbox-fs write '%s' %s", b64Data, cleanPath, overwriteStr)
-	res, err := e.Exec(ctx, sessID, cmd, "/scratch", 15, nil)
+	// Pass file content directly through stdin to sandbox-fs
+	argv := []string{"/usr/local/bin/sandbox-fs", "write", cleanPath, overwriteStr}
+	res, err := e.execInternalArgv(ctx, sessID, argv, []byte(content), 15)
 	if err != nil || (res != nil && res.ExitCode != 0) {
 		if res != nil && res.ExitCode == 17 {
 			return nil, fmt.Errorf("file '%s' already exists and overwrite is false", cleanPath)
@@ -622,9 +715,8 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 		return nil, fmt.Errorf("export denied for path '%s': %w", scratchPath, err)
 	}
 
-	// Verify regular file via sandbox-fs stat before export
-	statCmd := fmt.Sprintf("/usr/local/bin/sandbox-fs stat '%s'", cleanScratch)
-	statRes, err := e.Exec(ctx, sessID, statCmd, "/scratch", 10, nil)
+	statArgv := []string{"/usr/local/bin/sandbox-fs", "stat", cleanScratch}
+	statRes, err := e.execInternalArgv(ctx, sessID, statArgv, nil, 10)
 	if err != nil || statRes.ExitCode != 0 {
 		return nil, fmt.Errorf("failed to stat export source file '%s': %v", cleanScratch, err)
 	}
@@ -647,12 +739,15 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 		destName = path.Base(cleanScratch)
 	}
 	destName = filepath.Base(filepath.Clean(destName))
+	if strings.ContainsAny(destName, "/\\..") || destName == "." || destName == ".." {
+		return nil, fmt.Errorf("invalid destination name '%s'", destName)
+	}
+
 	sess, err := e.sessMgr.GetSession(sessID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Duplicate-safe destination naming
 	hostDest := filepath.Join(e.cfg.ExportDir, destName)
 	if _, err := os.Stat(hostDest); err == nil {
 		ext := filepath.Ext(destName)
@@ -688,46 +783,70 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 }
 
 func (e *Engine) StopSession(ctx context.Context, sessID string) error {
+	summary, err := e.cleanupSession(ctx, sessID)
+	if err != nil {
+		return fmt.Errorf("StopSession failed: %w (summary: %+v)", err, summary)
+	}
+	return nil
+}
+
+// cleanupSession is the single transactional cleanup function used by all stop, failure, and reset paths.
+func (e *Engine) cleanupSession(ctx context.Context, sessID string) (session.CleanupSummary, error) {
+	summary := session.CleanupSummary{CleanupRetryable: true}
+
 	sess, err := e.sessMgr.GetSession(sessID)
 	if err != nil {
-		return err
+		summary.CleanupError = err.Error()
+		return summary, err
 	}
 
-	// Verify resource ownership before destructive removal; ABORT IF VERIFICATION FAILS
-	if err := e.dockerClient.VerifyResourceOwnership(ctx, sess.ComposeProject, sess.ID); err != nil {
-		_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
-			s.Status = session.StateCleanupFailed
-			s.CleanupState = "cleanup-failed"
-			s.CleanupError = err.Error()
-			s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
-		})
-		return fmt.Errorf("ownership verification failed for session %s: %w", sessID, err)
+	snap := docker.ResourceSnapshot{
+		RunnerContainerID: sess.RunnerContainerID,
+		NetworkID:         sess.NetworkID,
+		ScratchVolumeName: sess.VolumeName,
 	}
-
-	_ = e.sessMgr.Transition(sessID, "", session.StateStopping)
 
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.cfg.Limits.ShutdownGraceSeconds)*time.Second)
 	defer cancel()
 
-	if err := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
-		_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
-			s.Status = session.StateCleanupFailed
-			s.CleanupState = "cleanup-failed"
-			s.CleanupError = err.Error()
-			s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
-		})
-		return fmt.Errorf("failed to stop session containers: %w", err)
+	// 1. Ownership verification
+	if err := e.dockerClient.VerifyResourceOwnership(cleanupCtx, sess.ComposeProject, sess.ID, snap); err != nil {
+		summary.CleanupError = fmt.Sprintf("ownership verification failed: %v", err)
+		e.recordCleanupFailure(sessID, summary)
+		return summary, fmt.Errorf("ownership verification failed for session %s: %w", sessID, err)
 	}
 
-	if err := e.sessMgr.RemoveSession(sessID); err != nil {
-		_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
-			s.Status = session.StateCleanupFailed
-			s.CleanupState = "cleanup-failed"
-			s.CleanupError = err.Error()
-			s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
-		})
-		return fmt.Errorf("failed to remove session state directory: %w", err)
+	// 2. Mark session stopping and wait for active exec leases to complete
+	if err := e.sessMgr.BeginStopping(cleanupCtx, sessID); err != nil {
+		summary.CleanupError = fmt.Sprintf("failed to begin stopping session: %v", err)
+		e.recordCleanupFailure(sessID, summary)
+		return summary, err
 	}
+
+	// 3. Run Docker ComposeDown
+	downErr := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath)
+
+	// 4. Inspect resources post-cleanup
+	runnerRemoved, networkRemoved, scratchRemoved, _ := e.dockerClient.VerifyResourcesAbsent(cleanupCtx, sess.ComposeProject, sess.ID, snap)
+	summary.RunnerRemoved = runnerRemoved
+	summary.NetworkRemoved = networkRemoved
+	summary.ScratchRemoved = scratchRemoved
+
+	if downErr != nil || !runnerRemoved || !networkRemoved || !scratchRemoved {
+		summary.CleanupError = fmt.Sprintf("docker cleanup incomplete (downErr: %v, runner: %v, net: %v, vol: %v)", downErr, runnerRemoved, networkRemoved, scratchRemoved)
+		e.recordCleanupFailure(sessID, summary)
+		return summary, fmt.Errorf("cleanup incomplete for session %s", sessID)
+	}
+
+	// 5. Remove session state ONLY when all owned resources are confirmed gone
+	if err := e.sessMgr.RemoveSession(sessID); err != nil {
+		summary.CleanupError = fmt.Sprintf("failed to remove state directory: %v", err)
+		e.recordCleanupFailure(sessID, summary)
+		return summary, err
+	}
+
+	summary.StateRemoved = true
+	summary.CleanupRetryable = false
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
@@ -738,7 +857,18 @@ func (e *Engine) StopSession(ctx context.Context, sessID string) error {
 		})
 	}
 
-	return nil
+	return summary, nil
+}
+
+func (e *Engine) recordCleanupFailure(sessID string, summary session.CleanupSummary) {
+	_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
+		s.Status = session.StateCleanupFailed
+		s.CleanupState = "cleanup-failed"
+		s.CleanupError = summary.CleanupError
+		s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
+		s.CleanupRetryable = true
+		s.Cleanup = summary
+	})
 }
 
 func (e *Engine) ResetSession(ctx context.Context, sessID string) (*StartResult, error) {
