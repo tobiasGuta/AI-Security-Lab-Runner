@@ -226,11 +226,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		err := s.engine.StopSession(ctx, p.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]string{"status": "stopped", "session_id": p.SessionID}, nil
+		return s.engine.StopSession(ctx, p.SessionID)
 
 	case "sandbox_reset":
 		var p struct {

@@ -19,6 +19,9 @@ func (m *MockDockerClient) CheckLinuxContainers(ctx context.Context) error  { re
 func (m *MockDockerClient) BuildImage(ctx context.Context, dockerfilePath, imageTag string) error {
 	return nil
 }
+func (m *MockDockerClient) GetImageVersion(ctx context.Context, imageName string) (string, error) {
+	return "2.0.0", nil
+}
 func (m *MockDockerClient) ComposeUp(ctx context.Context, projectName, composeFilePath string) (docker.ResourceSnapshot, error) {
 	return docker.ResourceSnapshot{
 		RunnerContainerID: "mock_c_12345",

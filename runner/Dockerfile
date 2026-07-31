@@ -1,5 +1,7 @@
 FROM ubuntu:24.04
 
+LABEL ai.security.lab-runner.version="2.0.0"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

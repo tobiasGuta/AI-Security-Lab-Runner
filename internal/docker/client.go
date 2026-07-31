@@ -54,6 +54,7 @@ type Client interface {
 	ListManagedResources(ctx context.Context) ([]string, error)
 	VerifyResourceOwnership(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) error
 	VerifyResourcesAbsent(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) (runnerRemoved, networkRemoved, scratchRemoved bool, err error)
+	GetImageVersion(ctx context.Context, imageName string) (string, error)
 }
 
 type CLIClient struct {
@@ -333,18 +334,18 @@ func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFi
 func (c *CLIClient) ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
 	var stdoutBuf bytes.Buffer
 	var writer io.Writer = &stdoutBuf
+	var bounded *output.BoundedWriter
 	if maxOutputBytes > 0 {
-		bounded := output.NewBoundedWriter(maxOutputBytes)
+		bounded = output.NewBoundedWriter(maxOutputBytes)
 		writer = bounded
-		defer func() {
-			stdout = bounded.String()
-			truncated = bounded.Truncated
-		}()
 	}
 
 	var stderrRes string
 	exitCode, stderrRes, timedOut, _, err = c.ExecArgvWithBinaryStdoutInRunner(ctx, projectName, composeFilePath, cwd, argv, stdin, env, timeout, writer, maxOutputBytes)
-	if maxOutputBytes <= 0 {
+	if bounded != nil {
+		stdout = bounded.String()
+		truncated = bounded.Truncated
+	} else {
 		stdout = stdoutBuf.String()
 	}
 	return exitCode, stdout, stderrRes, timedOut, truncated, err
@@ -454,4 +455,12 @@ func filepathDir(p string) string {
 		return "."
 	}
 	return p[:idx]
+}
+
+func (c *CLIClient) GetImageVersion(ctx context.Context, imageName string) (string, error) {
+	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "image", "inspect", "--format", "{{index .Config.Labels \"ai.security.lab-runner.version\"}}", imageName)
+	if err != nil || exitCode != 0 {
+		return "", fmt.Errorf("%w: failed to inspect image '%s': %s", ErrDockerExecFailed, imageName, stderr)
+	}
+	return strings.TrimSpace(stdout), nil
 }

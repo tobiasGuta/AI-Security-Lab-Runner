@@ -4,7 +4,7 @@ func GetDefinedTools() []Tool {
 	return []Tool{
 		{
 			Name:        "sandbox_run",
-			Description: "Execute a one-shot command inside a disposable, ephemeral sandbox runner container with automatic cleanup.",
+			Description: "Execute a one-shot command inside a disposable, ephemeral sandbox runner container. Creates a new disposable runner, does not share /scratch with persistent sessions, and its filesystem is destroyed after completion.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -26,7 +26,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_start",
-			Description: "Start a persistent sandbox session with outbound network access and host-gateway translation.",
+			Description: "Start a persistent sandbox session with outbound network access and host-gateway translation. Returns a session_id. All persistent operations must reuse that exact ID.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -47,7 +47,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_exec",
-			Description: "Execute a command inside a persistent sandbox session runner container.",
+			Description: "Execute a command inside a persistent sandbox session runner container. Executes only in the specified persistent session. Returned stdout and stderr are always included.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -73,7 +73,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_http_request",
-			Description: "Make a structured HTTP/HTTPS request inside the sandbox using trusted sandbox-http helper. Loopback URLs (localhost/127.0.0.1) translate to host gateway when enabled.",
+			Description: "Make a structured HTTP/HTTPS request inside the sandbox using trusted sandbox-http helper. When session_id is omitted, it uses an ephemeral runner. Ephemeral HTTP requests cannot access cookies or scratch files from a persistent session. To maintain cookies or files, always provide the persistent session_id.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -115,7 +115,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_write_file",
-			Description: "Write a script or data file strictly under /scratch in the sandbox container.",
+			Description: "Write a script or data file strictly under /scratch in the sandbox container. Operates only on the /scratch volume attached to the supplied session_id.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -145,7 +145,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_read_file",
-			Description: "Read a file strictly under /scratch inside the sandbox container.",
+			Description: "Read a file strictly under /scratch inside the sandbox container. Operates only on the /scratch volume attached to the supplied session_id.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{

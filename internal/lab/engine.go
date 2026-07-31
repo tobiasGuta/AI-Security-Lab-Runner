@@ -26,12 +26,43 @@ import (
 )
 
 var (
-	ErrExportDisabled     = errors.New("file export is disabled by security policy")
-	ErrInvalidScratchPath = errors.New("file operation is restricted strictly to /scratch descendants")
-	ErrInvalidHTTPMethod  = errors.New("invalid or unsupported HTTP method")
-	ErrInvalidHeaderName  = errors.New("invalid HTTP header name")
-	ErrPolicyDenied       = errors.New("POLICY_DENIED: requested feature exceeds global configuration policy ceiling")
+	ErrExportDisabled        = errors.New("file export is disabled by security policy")
+	ErrInvalidScratchPath    = errors.New("file operation is restricted strictly to /scratch descendants")
+	ErrInvalidHTTPMethod     = errors.New("invalid or unsupported HTTP method")
+	ErrInvalidHeaderName     = errors.New("invalid HTTP header name")
+	ErrPolicyDenied          = errors.New("POLICY_DENIED: requested feature exceeds global configuration policy ceiling")
+	ErrRunnerVersionMismatch = errors.New("RUNNER_VERSION_MISMATCH: runner image version is incompatible with controller version")
+	RequiredRunnerVersion    = "2.0.0"
 )
+
+func safeScopeID(sessID string) string {
+	if len(sessID) > 8 {
+		return sessID[:8]
+	}
+	if sessID == "" {
+		return "ephemeral"
+	}
+	return sessID
+}
+
+func runnerInstanceID(sessID string) string {
+	return "runner-" + safeScopeID(sessID)
+}
+
+func scratchScopeID(sessID string) string {
+	return "scratch-" + safeScopeID(sessID)
+}
+
+func (e *Engine) validateRunnerImage(ctx context.Context) error {
+	v, err := e.dockerClient.GetImageVersion(ctx, e.cfg.Runner.Image)
+	if err != nil {
+		return fmt.Errorf("%w: failed to inspect runner image '%s': %v", ErrRunnerVersionMismatch, e.cfg.Runner.Image, err)
+	}
+	if strings.TrimSpace(v) != RequiredRunnerVersion {
+		return fmt.Errorf("%w: runner image '%s' version '%s' does not match required version '%s'", ErrRunnerVersionMismatch, e.cfg.Runner.Image, v, RequiredRunnerVersion)
+	}
+	return nil
+}
 
 type Engine struct {
 	cfg          *config.Config
@@ -56,6 +87,8 @@ func NewEngine(cfg *config.Config, dockerClient docker.Client, auditLogger *audi
 
 type RunResult struct {
 	SessionID       string                 `json:"session_id"`
+	Operation       string                 `json:"operation"`
+	ExecutionMode   string                 `json:"execution_mode"`
 	Ephemeral       bool                   `json:"ephemeral"`
 	ExitCode        int                    `json:"exit_code"`
 	TimedOut        bool                   `json:"timed_out"`
@@ -68,6 +101,10 @@ type RunResult struct {
 }
 
 func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, env map[string]string) (*RunResult, error) {
+	if err := e.validateRunnerImage(ctx); err != nil {
+		return nil, err
+	}
+
 	timeoutSec = e.clampTimeout(timeoutSec)
 
 	sess, err := e.sessMgr.CreateSession(session.ModeEphemeral, 15, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled)
@@ -76,8 +113,10 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 	}
 
 	res := &RunResult{
-		SessionID: sess.ID,
-		Ephemeral: true,
+		SessionID:     sess.ID,
+		Operation:     "sandbox_run",
+		ExecutionMode: "ephemeral",
+		Ephemeral:     true,
 	}
 
 	defer func() {
@@ -161,16 +200,24 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 }
 
 type StartResult struct {
-	SessionID     string                 `json:"session_id"`
-	Status        string                 `json:"status"`
-	CreatedAt     time.Time              `json:"created_at"`
-	ExpiresAt     time.Time              `json:"expires_at"`
-	Network       config.NetworkConfig   `json:"network"`
-	HostGateway   string                 `json:"host_gateway"`
-	PolicySummary security.PolicySummary `json:"policy_summary"`
+	SessionID      string                 `json:"session_id"`
+	Operation      string                 `json:"operation"`
+	ExecutionMode  string                 `json:"execution_mode"`
+	RunnerInstance string                 `json:"runner_instance"`
+	ScratchScope   string                 `json:"scratch_scope"`
+	Status         string                 `json:"status"`
+	CreatedAt      time.Time              `json:"created_at"`
+	ExpiresAt      time.Time              `json:"expires_at"`
+	Network        config.NetworkConfig   `json:"network"`
+	HostGateway    string                 `json:"host_gateway"`
+	PolicySummary  security.PolicySummary `json:"policy_summary"`
 }
 
 func (e *Engine) StartSession(ctx context.Context, reqOutbound, reqHostAccess *bool, ttlMinutes int) (*StartResult, error) {
+	if err := e.validateRunnerImage(ctx); err != nil {
+		return nil, err
+	}
+
 	effectiveOutbound, err := e.resolveNetworkPolicy(reqOutbound, e.cfg.Network.OutboundEnabled, "outbound_network")
 	if err != nil {
 		return nil, err
@@ -226,18 +273,26 @@ func (e *Engine) StartSession(ctx context.Context, reqOutbound, reqHostAccess *b
 	netPolicy.HostGatewayEnabled = sess.HostGatewayEnabled
 
 	return &StartResult{
-		SessionID:     sess.ID,
-		Status:        string(session.StateReady),
-		CreatedAt:     sess.CreatedAt,
-		ExpiresAt:     sess.ExpiresAt,
-		Network:       netPolicy,
-		HostGateway:   e.cfg.Network.HostGatewayName,
-		PolicySummary: security.GetPolicySummary(e.cfg),
+		SessionID:      sess.ID,
+		Operation:      "sandbox_start",
+		ExecutionMode:  "persistent",
+		RunnerInstance: runnerInstanceID(sess.ID),
+		ScratchScope:   scratchScopeID(sess.ID),
+		Status:         string(session.StateReady),
+		CreatedAt:      sess.CreatedAt,
+		ExpiresAt:      sess.ExpiresAt,
+		Network:        netPolicy,
+		HostGateway:    e.cfg.Network.HostGatewayName,
+		PolicySummary:  security.GetPolicySummary(e.cfg),
 	}, nil
 }
 
 type ExecResult struct {
 	SessionID       string `json:"session_id"`
+	Operation       string `json:"operation"`
+	ExecutionMode   string `json:"execution_mode"`
+	RunnerInstance  string `json:"runner_instance"`
+	ScratchScope    string `json:"scratch_scope"`
 	ExitCode        int    `json:"exit_code"`
 	TimedOut        bool   `json:"timed_out"`
 	DurationMS      int64  `json:"duration_ms"`
@@ -304,6 +359,10 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 
 	return &ExecResult{
 		SessionID:       sessID,
+		Operation:       "sandbox_exec",
+		ExecutionMode:   "persistent",
+		RunnerInstance:  runnerInstanceID(sessID),
+		ScratchScope:    scratchScopeID(sessID),
 		ExitCode:        exitCode,
 		TimedOut:        timedOut,
 		DurationMS:      duration,
@@ -434,19 +493,25 @@ type HTTPRequestOptions struct {
 }
 
 type HTTPRequestResult struct {
-	RequestedURL           string              `json:"requested_url"`
-	EffectiveURL           string              `json:"effective_url"`
-	StatusCode             int                 `json:"status_code"`
-	Headers                map[string][]string `json:"headers"`
-	Body                   string              `json:"body"`
-	BodyBase64             bool                `json:"body_base64"`
-	DurationMS             int64               `json:"duration_ms"`
-	RedirectChain          []string            `json:"redirect_chain"`
-	ExitCode               int                 `json:"curl_exit_code"` // Kept JSON tag for backward compatibility
-	ErrorCategory          string              `json:"error_category,omitempty"`
-	HostGatewayTranslation bool                `json:"host_gateway_translation"`
-	ConnectionHost         string              `json:"connection_host"`
-	Truncated              bool                `json:"truncated"`
+	SessionID              string                  `json:"session_id"`
+	Operation              string                  `json:"operation"`
+	ExecutionMode          string                  `json:"execution_mode"`
+	RunnerInstance         string                  `json:"runner_instance,omitempty"`
+	ScratchScope           string                  `json:"scratch_scope,omitempty"`
+	Cleanup                *session.CleanupSummary `json:"cleanup,omitempty"`
+	RequestedURL           string                  `json:"requested_url"`
+	EffectiveURL           string                  `json:"effective_url"`
+	StatusCode             int                     `json:"status_code"`
+	Headers                map[string][]string     `json:"headers"`
+	Body                   string                  `json:"body"`
+	BodyBase64             bool                    `json:"body_base64"`
+	DurationMS             int64                   `json:"duration_ms"`
+	RedirectChain          []string                `json:"redirect_chain"`
+	ExitCode               int                     `json:"curl_exit_code"` // Kept JSON tag for backward compatibility
+	ErrorCategory          string                  `json:"error_category,omitempty"`
+	HostGatewayTranslation bool                    `json:"host_gateway_translation"`
+	ConnectionHost         string                  `json:"connection_host"`
+	Truncated              bool                    `json:"truncated"`
 }
 
 func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTTPRequestResult, error) {
@@ -471,9 +536,11 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 	}
 
 	hostGatewayEnabled := e.cfg.Network.HostGatewayEnabled
+	isPersistent := false
 	if opts.SessionID != "" {
 		if sess, err := e.sessMgr.GetSession(opts.SessionID); err == nil {
 			hostGatewayEnabled = sess.HostGatewayEnabled
+			isPersistent = true
 		}
 	}
 
@@ -508,6 +575,17 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		return nil, fmt.Errorf("failed to parse sandbox-http JSON output: %w (raw: %s)", err, execRes.Stdout)
 	}
 
+	resDoc.SessionID = execRes.SessionID
+	resDoc.Operation = "sandbox_http_request"
+	if isPersistent {
+		resDoc.ExecutionMode = "persistent"
+		resDoc.RunnerInstance = runnerInstanceID(execRes.SessionID)
+		resDoc.ScratchScope = scratchScopeID(execRes.SessionID)
+	} else {
+		resDoc.ExecutionMode = "ephemeral"
+		resDoc.Cleanup = &session.CleanupSummary{RunnerRemoved: true, NetworkRemoved: true, ScratchRemoved: true, StateRemoved: true}
+	}
+
 	if e.auditLogger != nil {
 		sanitizedURL := opts.URL
 		if u, err := url.Parse(opts.URL); err == nil && u.User != nil {
@@ -538,11 +616,15 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 }
 
 type ReadResult struct {
-	SessionID string `json:"session_id"`
-	Path      string `json:"path"`
-	Content   string `json:"content"`
-	Encoding  string `json:"encoding"`
-	Truncated bool   `json:"truncated"`
+	SessionID      string `json:"session_id"`
+	Operation      string `json:"operation"`
+	ExecutionMode  string `json:"execution_mode"`
+	RunnerInstance string `json:"runner_instance"`
+	ScratchScope   string `json:"scratch_scope"`
+	Path           string `json:"path"`
+	Content        string `json:"content"`
+	Encoding       string `json:"encoding"`
+	Truncated      bool   `json:"truncated"`
 }
 
 func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, offset int64, maxBytes int64, binaryEncoding string) (*ReadResult, error) {
@@ -607,16 +689,24 @@ func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, off
 	}
 
 	return &ReadResult{
-		SessionID: sessID,
-		Path:      cleanPath,
-		Content:   content,
-		Encoding:  binaryEncoding,
-		Truncated: isTruncated,
+		SessionID:      sessID,
+		Operation:      "sandbox_read_file",
+		ExecutionMode:  "persistent",
+		RunnerInstance: runnerInstanceID(sessID),
+		ScratchScope:   scratchScopeID(sessID),
+		Path:           cleanPath,
+		Content:        content,
+		Encoding:       binaryEncoding,
+		Truncated:      isTruncated,
 	}, nil
 }
 
 type WriteResult struct {
 	SessionID      string `json:"session_id"`
+	Operation      string `json:"operation"`
+	ExecutionMode  string `json:"execution_mode"`
+	RunnerInstance string `json:"runner_instance"`
+	ScratchScope   string `json:"scratch_scope"`
 	NormalizedPath string `json:"normalized_path"`
 	BytesWritten   int64  `json:"bytes_written"`
 }
@@ -668,6 +758,10 @@ func (e *Engine) WriteFile(ctx context.Context, sessID, scratchPath, content, en
 
 	return &WriteResult{
 		SessionID:      sessID,
+		Operation:      "sandbox_write_file",
+		ExecutionMode:  "persistent",
+		RunnerInstance: runnerInstanceID(sessID),
+		ScratchScope:   scratchScopeID(sessID),
 		NormalizedPath: cleanPath,
 		BytesWritten:   int64(len(content)),
 	}, nil
@@ -675,6 +769,10 @@ func (e *Engine) WriteFile(ctx context.Context, sessID, scratchPath, content, en
 
 type PublicStatus struct {
 	SessionID       string                `json:"session_id"`
+	Operation       string                `json:"operation"`
+	ExecutionMode   string                `json:"execution_mode"`
+	RunnerInstance  string                `json:"runner_instance"`
+	ScratchScope    string                `json:"scratch_scope"`
 	Mode            string                `json:"mode"`
 	Status          string                `json:"status"`
 	CreatedAt       time.Time             `json:"created_at"`
@@ -692,6 +790,10 @@ func (e *Engine) Status(sessID string) (interface{}, error) {
 		}
 		return PublicStatus{
 			SessionID:       s.ID,
+			Operation:       "sandbox_status",
+			ExecutionMode:   "persistent",
+			RunnerInstance:  runnerInstanceID(s.ID),
+			ScratchScope:    scratchScopeID(s.ID),
 			Mode:            string(s.Mode),
 			Status:          string(s.Status),
 			CreatedAt:       s.CreatedAt,
@@ -707,6 +809,10 @@ func (e *Engine) Status(sessID string) (interface{}, error) {
 	for _, s := range sessions {
 		publicList = append(publicList, PublicStatus{
 			SessionID:       s.ID,
+			Operation:       "sandbox_status",
+			ExecutionMode:   "persistent",
+			RunnerInstance:  runnerInstanceID(s.ID),
+			ScratchScope:    scratchScopeID(s.ID),
 			Mode:            string(s.Mode),
 			Status:          string(s.Status),
 			CreatedAt:       s.CreatedAt,
@@ -814,20 +920,42 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 	}
 
 	return map[string]interface{}{
-		"session_id":  sessID,
-		"source_path": cleanScratch,
-		"export_path": cleanDest,
-		"sha256":      shaHex,
-		"bytes":       fileBytes,
+		"session_id":      sessID,
+		"operation":       "sandbox_export_file",
+		"execution_mode":  "persistent",
+		"runner_instance": runnerInstanceID(sessID),
+		"scratch_scope":   scratchScopeID(sessID),
+		"source_path":     cleanScratch,
+		"export_path":     cleanDest,
+		"sha256":          shaHex,
+		"bytes":           fileBytes,
 	}, nil
 }
 
-func (e *Engine) StopSession(ctx context.Context, sessID string) error {
+type StopResult struct {
+	SessionID      string                 `json:"session_id"`
+	Operation      string                 `json:"operation"`
+	ExecutionMode  string                 `json:"execution_mode"`
+	RunnerInstance string                 `json:"runner_instance"`
+	ScratchScope   string                 `json:"scratch_scope"`
+	Status         string                 `json:"status"`
+	Cleanup        session.CleanupSummary `json:"cleanup"`
+}
+
+func (e *Engine) StopSession(ctx context.Context, sessID string) (*StopResult, error) {
 	summary, err := e.cleanupSession(ctx, sessID)
 	if err != nil {
-		return fmt.Errorf("StopSession failed: %w (summary: %+v)", err, summary)
+		return nil, fmt.Errorf("StopSession failed: %w (summary: %+v)", err, summary)
 	}
-	return nil
+	return &StopResult{
+		SessionID:      sessID,
+		Operation:      "sandbox_stop",
+		ExecutionMode:  "persistent",
+		RunnerInstance: runnerInstanceID(sessID),
+		ScratchScope:   scratchScopeID(sessID),
+		Status:         "stopped",
+		Cleanup:        summary,
+	}, nil
 }
 
 // cleanupSession is the single transactional cleanup function used by all stop, failure, and reset paths.
@@ -965,7 +1093,7 @@ func (e *Engine) ResetSession(ctx context.Context, sessID string) (*StartResult,
 		hostAccess = sess.HostGatewayEnabled
 	}
 
-	if err := e.StopSession(ctx, sessID); err != nil {
+	if _, err := e.StopSession(ctx, sessID); err != nil {
 		return nil, fmt.Errorf("cannot reset session: StopSession failed: %w", err)
 	}
 

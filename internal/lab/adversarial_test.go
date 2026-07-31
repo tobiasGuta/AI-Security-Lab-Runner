@@ -192,7 +192,7 @@ func TestTransactionalCleanupFailureRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = eng.StopSession(context.Background(), startRes.SessionID)
+	_, err = eng.StopSession(context.Background(), startRes.SessionID)
 	if err == nil {
 		t.Fatalf("expected StopSession to fail when ownership verification fails")
 	}

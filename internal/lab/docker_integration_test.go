@@ -59,7 +59,7 @@ func TestDockerIntegrationFullSuite(t *testing.T) {
 	}
 
 	defer func() {
-		_ = eng.StopSession(ctx, sessID)
+		_, _ = eng.StopSession(ctx, sessID)
 	}()
 
 	// 2. Public HTTPS Request via sandbox-http
@@ -88,63 +88,92 @@ func TestDockerIntegrationFullSuite(t *testing.T) {
 		t.Errorf("Localhost translation HTTP request failed: err=%v, res=%+v", err, localHTTPRes)
 	}
 
-	// 4. Host Translation Disabled Test
+	// 4. Host Translation Disabled Test (Must NOT be silently skipped)
 	falseVal := false
 	trueVal := true
 	startDisabledRes, err := eng.StartSession(ctx, &trueVal, &falseVal, 15)
-	if err == nil {
-		sessDisabledID := startDisabledRes.SessionID
-		defer func() { _ = eng.StopSession(ctx, sessDisabledID) }()
+	if err != nil {
+		t.Fatalf("Host translation disabled StartSession failed unexpectedly: %v", err)
+	}
+	sessDisabledID := startDisabledRes.SessionID
+	defer func() { _, _ = eng.StopSession(ctx, sessDisabledID) }()
 
-		httpRes, errHost := eng.HTTPRequest(ctx, HTTPRequestOptions{
-			SessionID: sessDisabledID,
-			Method:    "GET",
-			URL:       "http://localhost:9999/",
-		})
-		if errHost == nil && (httpRes == nil || (httpRes.ErrorCategory != "POLICY_DENIED" && !strings.Contains(httpRes.Body, "POLICY_DENIED"))) {
-			t.Errorf("expected POLICY_DENIED for loopback URL on disabled session, got err=%v, res=%+v", errHost, httpRes)
-		}
+	if sessDisabledID == sessID {
+		t.Fatalf("Session IDs must differ between sessions: main=%s, disabled=%s", sessID, sessDisabledID)
 	}
 
-	// 5. Persistent Write & Read
+	httpResHost, errHost := eng.HTTPRequest(ctx, HTTPRequestOptions{
+		SessionID: sessDisabledID,
+		Method:    "GET",
+		URL:       "http://localhost:9999/",
+	})
+	if errHost == nil && (httpResHost == nil || (httpResHost.ErrorCategory != "POLICY_DENIED" && !strings.Contains(httpResHost.Body, "POLICY_DENIED"))) {
+		t.Errorf("expected POLICY_DENIED for loopback URL on disabled session, got err=%v, res=%+v", errHost, httpResHost)
+	}
+
+	// 5. sandbox_exec Stdout Check & Persistent Write/Read Scratch Scope Assertion
+	execCmdRes, err := eng.Exec(ctx, sessID, "echo 'EXEC_EXPECTED_STDOUT'", "/scratch", 10, nil)
+	if err != nil {
+		t.Fatalf("sandbox_exec failed unexpectedly: %v", err)
+	}
+	if execCmdRes.ExitCode != 0 || strings.TrimSpace(execCmdRes.Stdout) != "EXEC_EXPECTED_STDOUT" {
+		t.Fatalf("sandbox_exec stdout empty or unexpected: exitCode=%d, stdout=%q, err=%v", execCmdRes.ExitCode, execCmdRes.Stdout, err)
+	}
+
 	testPayload := "integration test payload data"
-	_, err = eng.WriteFile(ctx, sessID, "/scratch/int_test.txt", testPayload, "utf-8", true)
+	writeRes, err := eng.WriteFile(ctx, sessID, "/scratch/int_test.txt", testPayload, "utf-8", true)
 	if err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if writeRes.SessionID != sessID {
+		t.Fatalf("WriteFile session ID mismatch: expected %s, got %s", sessID, writeRes.SessionID)
 	}
 
 	readRes, err := eng.ReadFile(ctx, sessID, "/scratch/int_test.txt", 0, 100, "utf-8")
 	if err != nil || readRes.Content != testPayload {
 		t.Fatalf("ReadFile failed: err=%v, content=%s", err, readRes.Content)
 	}
+	if readRes.SessionID != sessID {
+		t.Fatalf("ReadFile session ID mismatch: expected %s, got %s", sessID, readRes.SessionID)
+	}
+	if writeRes.ScratchScope != readRes.ScratchScope {
+		t.Fatalf("Write/Read scratch volume scope mismatch: writeScope=%s, readScope=%s", writeRes.ScratchScope, readRes.ScratchScope)
+	}
 
-	// 6. Timeout Child Termination
+	// 6. Timeout Child Termination Verification
 	runRes, err := eng.Run(ctx, "sleep 10", "/scratch", 1, nil)
-	if err == nil && !runRes.TimedOut && runRes.ExitCode != 124 {
+	if err != nil {
+		t.Fatalf("Timeout execution returned unexpected infrastructure error: %v", err)
+	}
+	if !runRes.TimedOut && runRes.ExitCode != 124 {
 		t.Errorf("expected timeout for sleep 10, got: %+v", runRes)
 	}
 
 	// 7. Symlink Rejection
-	_, _ = eng.Exec(ctx, sessID, "ln -s /etc/passwd /scratch/passwd_link", "/scratch", 10, nil)
+	execSym, errExecSym := eng.Exec(ctx, sessID, "ln -s /etc/passwd /scratch/passwd_link", "/scratch", 10, nil)
+	if errExecSym != nil || execSym.ExitCode != 0 {
+		t.Fatalf("Symlink creation in container failed: err=%v, res=%+v", errExecSym, execSym)
+	}
 	_, errSym := eng.ReadFile(ctx, sessID, "/scratch/passwd_link", 0, 100, "utf-8")
 	if errSym == nil {
 		t.Errorf("expected error when reading symlink under /scratch, got nil")
 	}
 
 	// 8. Streaming Export Verification
-	exportRes, err := eng.ExportFile(ctx, sessID, "/scratch/int_test.txt", "exported_report.txt")
+	exportResObj, err := eng.ExportFile(ctx, sessID, "/scratch/int_test.txt", "exported_report.txt")
 	if err != nil {
 		t.Errorf("ExportFile failed: %v", err)
 	} else {
-		m, ok := exportRes.(map[string]interface{})
-		if !ok || m["export_path"] == "" {
-			t.Errorf("ExportFile result invalid: %+v", exportRes)
+		m, ok := exportResObj.(map[string]interface{})
+		if !ok || m["export_path"] == "" || m["session_id"] != sessID {
+			t.Errorf("ExportFile result invalid: %+v", exportResObj)
 		}
 	}
 
 	// 9. Stop Session & Verify Absence
-	if err := eng.StopSession(ctx, sessID); err != nil {
-		t.Fatalf("StopSession failed: %v", err)
+	stopRes, err := eng.StopSession(ctx, sessID)
+	if err != nil || stopRes.Status != "stopped" {
+		t.Fatalf("StopSession failed: err=%v, res=%+v", err, stopRes)
 	}
 
 	_, getErr := eng.sessMgr.GetSession(sessID)

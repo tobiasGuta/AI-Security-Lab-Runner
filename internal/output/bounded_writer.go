@@ -23,7 +23,8 @@ func NewBoundedWriter(maxBytes int64) *BoundedWriter {
 func (bw *BoundedWriter) Write(p []byte) (n int, err error) {
 	n = len(p)
 	if bw.maxBytes <= 0 {
-		bw.Truncated = true
+		bw.buf.Write(p)
+		bw.written += int64(len(p))
 		return n, nil
 	}
 

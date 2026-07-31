@@ -532,7 +532,7 @@ func cmdSandboxStop(args []string) {
 	}
 
 	ctx := context.Background()
-	if err := engine.StopSession(ctx, sessID); err != nil {
+	if _, err := engine.StopSession(ctx, sessID); err != nil {
 		fmt.Fprintf(os.Stderr, "Stop error: %v\n", err)
 		os.Exit(1)
 	}
@@ -646,6 +646,8 @@ func cmdDoctor(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	addCheck("Controller Version", "PASS", Version, "")
+
 	if err := dockerClient.CheckDockerAvailable(ctx); err != nil {
 		addCheck("Docker Daemon Connectivity", "FAIL", err.Error(), "Ensure Docker Desktop or Docker Engine is running.")
 	} else {
@@ -664,10 +666,35 @@ func cmdDoctor(args []string) {
 		addCheck("Linux Containers Check", "PASS", "Linux container backend active", "")
 	}
 
+	runnerImage := "ai-security-agent-runner:latest"
+	if cfg != nil && cfg.Runner.Image != "" {
+		runnerImage = cfg.Runner.Image
+	}
+
+	imageVer, verErr := dockerClient.GetImageVersion(ctx, runnerImage)
+	if verErr != nil || imageVer == "" {
+		addCheck("Runner Image Version", "FAIL", fmt.Sprintf("Runner image '%s' missing or version label unreadable: %v", runnerImage, verErr), "Run 'docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/' to build the runner image.")
+		addCheck("Image Rebuild Required", "FAIL", "Runner image must be rebuilt", "Execute: docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/")
+	} else {
+		addCheck("Runner Image Version", "PASS", imageVer, "")
+		if imageVer != Version {
+			addCheck("Image Rebuild Required", "FAIL", fmt.Sprintf("Runner image version '%s' does not match controller version '%s'", imageVer, Version), "Execute: docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/")
+		} else {
+			addCheck("Image Rebuild Required", "PASS", "Runner image is up to date", "")
+		}
+	}
+
 	if cfg != nil {
-		// Disposable Outbound DNS and HTTPS check
+		// Disposable Outbound DNS and HTTPS check & Helper Version Verification
 		engine, err := lab.NewEngine(cfg, dockerClient, nil)
 		if err == nil {
+			helperRes, helperErr := engine.Run(ctx, "/usr/local/bin/sandbox-fs --help; /usr/local/bin/sandbox-http --help", "/scratch", 15, nil)
+			if helperErr == nil && helperRes.ExitCode == 0 {
+				addCheck("Runner Helper Binaries", "PASS", fmt.Sprintf("sandbox-fs and sandbox-http available in runner (image version %s)", imageVer), "")
+			} else {
+				addCheck("Runner Helper Binaries", "WARN", fmt.Sprintf("Helper check failed: %v", helperErr), "Rebuild runner image.")
+			}
+
 			runRes, err := engine.Run(ctx, "curl -s https://example.com", "/scratch", 15, nil)
 			if err != nil || runRes.ExitCode != 0 {
 				addCheck("Outbound Network & HTTPS Check", "WARN", fmt.Sprintf("Disposable runner HTTP test failed (exit code %d)", runRes.ExitCode), "Check internet connectivity or firewall rules.")
