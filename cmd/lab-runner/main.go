@@ -90,6 +90,16 @@ func loadEngine(configPath string) (*config.Config, *lab.Engine, error) {
 	return cfg, engine, nil
 }
 
+func isFlagPassed(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func cmdSandbox(args []string) {
 	if len(args) == 0 {
 		printUsage()
@@ -197,11 +207,13 @@ func cmdSandboxRun(args []string) {
 func cmdSandboxStart(args []string) {
 	fs := flag.NewFlagSet("sandbox start", flag.ExitOnError)
 	ttl := fs.Int("ttl", 60, "Session TTL in minutes")
+	outbound := fs.Bool("outbound", true, "Enable outbound network access")
+	hostAccess := fs.Bool("host-access", true, "Enable host gateway mapping")
 	jsonMode := fs.Bool("json", false, "JSON output format")
 	configPath := fs.String("config", "", "Path to config file")
 	_ = fs.Parse(args)
 
-	cfg, engine, err := loadEngine(*configPath)
+	_, engine, err := loadEngine(*configPath)
 	if err != nil {
 		output.PrintError(*jsonMode, "CONFIG_ERROR", err.Error())
 		os.Exit(1)
@@ -210,7 +222,15 @@ func cmdSandboxStart(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	res, err := engine.StartSession(ctx, cfg.Network.OutboundEnabled, cfg.Network.HostGatewayEnabled, *ttl)
+	var outboundPtr, hostAccessPtr *bool
+	if isFlagPassed(fs, "outbound") {
+		outboundPtr = outbound
+	}
+	if isFlagPassed(fs, "host-access") {
+		hostAccessPtr = hostAccess
+	}
+
+	res, err := engine.StartSession(ctx, outboundPtr, hostAccessPtr, *ttl)
 	if err != nil {
 		output.PrintError(*jsonMode, "START_FAILED", err.Error())
 		os.Exit(1)

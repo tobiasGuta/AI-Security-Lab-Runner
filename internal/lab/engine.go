@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +28,7 @@ var (
 	ErrInvalidScratchPath = errors.New("file operation is restricted strictly to /scratch descendants")
 	ErrInvalidHTTPMethod  = errors.New("invalid or unsupported HTTP method")
 	ErrInvalidHeaderName  = errors.New("invalid HTTP header name")
+	ErrPolicyDenied       = errors.New("POLICY_DENIED: requested feature exceeds global configuration policy ceiling")
 )
 
 type Engine struct {
@@ -71,9 +71,7 @@ type RunResult struct {
 	Cleanup         CleanupSummary `json:"cleanup"`
 }
 
-// Run executes a one-shot command in a disposable, ephemeral sandbox container with deferred verified cleanup.
 func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, env map[string]string) (*RunResult, error) {
-	// Clamp timeout against MaximumTimeoutSeconds
 	timeoutSec = e.clampTimeout(timeoutSec)
 
 	sess, err := e.sessMgr.CreateSession(session.ModeEphemeral, 15, e.cfg.Network.OutboundEnabled, e.cfg.Network.HostGatewayEnabled)
@@ -86,9 +84,9 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 		Ephemeral: true,
 	}
 
-	// Defer verified auto-cleanup using independent background context
+	// Defer verified auto-cleanup using independent bounded context
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.cfg.Limits.ShutdownGraceSeconds)*time.Second)
 		defer cancel()
 
 		downErr := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath)
@@ -152,6 +150,7 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 			SessionID:       sess.ID,
 			Interface:       "engine",
 			ToolOrCommand:   "sandbox_run",
+			AuditMode:       audit.AuditCommand,
 			DurationMS:      res.DurationMS,
 			ExitCode:        &exitCode,
 			TimedOut:        timedOut,
@@ -177,8 +176,17 @@ type StartResult struct {
 	PolicySummary security.PolicySummary `json:"policy_summary"`
 }
 
-func (e *Engine) StartSession(ctx context.Context, outboundNetwork, hostAccess bool, ttlMinutes int) (*StartResult, error) {
-	sess, err := e.sessMgr.CreateSession(session.ModePersistent, ttlMinutes, outboundNetwork, hostAccess)
+func (e *Engine) StartSession(ctx context.Context, reqOutbound, reqHostAccess *bool, ttlMinutes int) (*StartResult, error) {
+	effectiveOutbound, err := e.resolveNetworkPolicy(reqOutbound, e.cfg.Network.OutboundEnabled, "outbound_network")
+	if err != nil {
+		return nil, err
+	}
+	effectiveHostAccess, err := e.resolveNetworkPolicy(reqHostAccess, e.cfg.Network.HostGatewayEnabled, "host_access")
+	if err != nil {
+		return nil, err
+	}
+
+	sess, err := e.sessMgr.CreateSession(session.ModePersistent, ttlMinutes, effectiveOutbound, effectiveHostAccess)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +217,7 @@ func (e *Engine) StartSession(ctx context.Context, outboundNetwork, hostAccess b
 			SessionID:     sess.ID,
 			Interface:     "engine",
 			ToolOrCommand: "sandbox_start",
+			AuditMode:     audit.AuditMetadataOnly,
 			Resources:     []string{sess.ComposeProject},
 		})
 	}
@@ -240,7 +249,6 @@ type ExecResult struct {
 }
 
 func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutSec int, env map[string]string) (*ExecResult, error) {
-	// Clamp timeout against MaximumTimeoutSeconds
 	timeoutSec = e.clampTimeout(timeoutSec)
 
 	sess, err := e.sessMgr.GetSession(sessID)
@@ -260,12 +268,11 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 		return nil, fmt.Errorf("invalid execution working directory: %w", err)
 	}
 
-	lock, err := e.sessMgr.GetExecLock(sessID)
+	releaseSem, err := e.sessMgr.AcquireExecSemaphores(ctx, sessID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("concurrency limit exceeded: %w", err)
 	}
-	lock.Lock()
-	defer lock.Unlock()
+	defer releaseSem()
 
 	_ = e.sessMgr.SetActiveExecCount(sessID, 1)
 	defer func() { _ = e.sessMgr.SetActiveExecCount(sessID, -1) }()
@@ -290,6 +297,7 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 			SessionID:       sessID,
 			Interface:       "engine",
 			ToolOrCommand:   "sandbox_exec",
+			AuditMode:       audit.AuditCommand,
 			DurationMS:      duration,
 			ExitCode:        &exitCode,
 			TimedOut:        timedOut,
@@ -328,17 +336,21 @@ type HTTPRequestOptions struct {
 }
 
 type HTTPRequestResult struct {
-	RequestedURL           string            `json:"requested_url"`
-	ConnectionHost         string            `json:"connection_host"`
-	HostGatewayTranslation bool              `json:"host_gateway_translation"`
-	StatusCode             int               `json:"status_code"`
-	Headers                map[string]string `json:"headers"`
-	Body                   string            `json:"body"`
-	DurationMS             int64             `json:"duration_ms"`
-	CurlExitCode           int               `json:"curl_exit_code"`
-	Truncated              bool              `json:"truncated"`
+	RequestedURL           string              `json:"requested_url"`
+	EffectiveURL           string              `json:"effective_url"`
+	StatusCode             int                 `json:"status_code"`
+	Headers                map[string][]string `json:"headers"`
+	Body                   string              `json:"body"`
+	DurationMS             int64               `json:"duration_ms"`
+	RedirectChain          []string            `json:"redirect_chain"`
+	CurlExitCode           int                 `json:"curl_exit_code"`
+	ErrorCategory          string              `json:"error_category,omitempty"`
+	HostGatewayTranslation bool                `json:"host_gateway_translation"`
+	ConnectionHost         string              `json:"connection_host"`
+	Truncated              bool                `json:"truncated"`
 }
 
+// HTTPRequest executes a structured HTTP request using the trusted compiled sandbox-http Go helper binary.
 func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTTPRequestResult, error) {
 	if opts.URL == "" {
 		return nil, fmt.Errorf("URL cannot be empty")
@@ -349,97 +361,39 @@ func (e *Engine) HTTPRequest(ctx context.Context, opts HTTPRequestOptions) (*HTT
 		return nil, fmt.Errorf("invalid URL scheme (must be http or https): %s", opts.URL)
 	}
 
-	method := strings.ToUpper(opts.Method)
-	if method == "" {
-		method = "GET"
-	}
+	opts.TimeoutSeconds = e.clampTimeout(opts.TimeoutSeconds)
 
-	hostname := parsedURL.Hostname()
-	port := parsedURL.Port()
-	if port == "" {
-		if parsedURL.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-
-	isLoopback := hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
-	connectionHost := hostname
-	gatewayTranslation := false
-
-	var curlConnectTo string
-	if isLoopback {
-		connectionHost = e.cfg.Network.HostGatewayName
-		if connectionHost == "" {
-			connectionHost = "host.docker.internal"
-		}
-		gatewayTranslation = true
-		curlConnectTo = fmt.Sprintf("%s:%s:%s:%s", hostname, port, connectionHost, port)
-	}
-
-	// Safely pass HTTP spec parameters via temporary base64 payload inside container to eliminate shell expansion/injection
-	reqSpecID := audit.GenerateEventID()
-	bodyB64 := base64.StdEncoding.EncodeToString([]byte(opts.Body))
-
-	// Validate header names
-	for k := range opts.Headers {
+	for k, v := range opts.Headers {
 		if strings.ContainsAny(k, "\r\n:") {
 			return nil, fmt.Errorf("%w: invalid header name '%s'", ErrInvalidHeaderName, k)
 		}
-	}
-
-	headersJSON, _ := json.Marshal(opts.Headers)
-	headersB64 := base64.StdEncoding.EncodeToString(headersJSON)
-
-	var extraFlags []string
-	if opts.FollowRedirects {
-		extraFlags = append(extraFlags, "-L")
-	}
-	if opts.InsecureTLS {
-		extraFlags = append(extraFlags, "-k")
-	}
-	if curlConnectTo != "" {
-		extraFlags = append(extraFlags, "--connect-to", curlConnectTo)
-	}
-	if opts.LoadCookiesPath != "" {
-		if clean, err := pathsafe.ValidateContainerPathUnderAllowed(opts.LoadCookiesPath, []string{"/scratch"}); err == nil {
-			extraFlags = append(extraFlags, "-b", clean)
-		}
-	}
-	if opts.SaveCookiesPath != "" {
-		if clean, err := pathsafe.ValidateContainerPathUnderAllowed(opts.SaveCookiesPath, []string{"/scratch"}); err == nil {
-			extraFlags = append(extraFlags, "-c", clean)
+		if strings.ContainsAny(v, "\r\n") {
+			return nil, fmt.Errorf("%w: CRLF in header value for key '%s'", ErrInvalidHeaderName, k)
 		}
 	}
 
-	flagsStr := strings.Join(extraFlags, " ")
+	specObj := map[string]interface{}{
+		"method":               opts.Method,
+		"url":                  opts.URL,
+		"headers":              opts.Headers,
+		"body":                 opts.Body,
+		"follow_redirects":     opts.FollowRedirects,
+		"insecure_tls":         opts.InsecureTLS,
+		"timeout_seconds":      opts.TimeoutSeconds,
+		"save_cookies_path":    opts.SaveCookiesPath,
+		"load_cookies_path":    opts.LoadCookiesPath,
+		"host_gateway_name":    e.cfg.Network.HostGatewayName,
+		"host_gateway_enabled": e.cfg.Network.HostGatewayEnabled,
+		"max_response_bytes":   e.cfg.Limits.MaximumReadBytes,
+	}
 
-	// Shell payload executes python3 or node inside runner to construct curl command cleanly without host argument breaking
-	pyScript := fmt.Sprintf(`import base64, json, subprocess, sys
-body = base64.b64decode("%s")
-headers = json.loads(base64.b64decode("%s"))
-url = "%s"
-method = "%s"
-extra_flags = "%s".split() if "%s" else []
+	specData, err := json.Marshal(specObj)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize HTTP request specification: %w", err)
+	}
 
-cmd = ["curl", "-s", "-i", "-X", method] + extra_flags
-for k, v in headers.items():
-    cmd.extend(["-H", f"{k}: {v}"])
-if body:
-    cmd.extend(["--data-binary", "@-"])
-cmd.append(url)
-
-proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-stdout, stderr = proc.communicate(input=body)
-sys.stdout.buffer.write(stdout)
-sys.exit(proc.returncode)
-`, bodyB64, headersB64, opts.URL, method, flagsStr, flagsStr)
-
-	pyScriptB64 := base64.StdEncoding.EncodeToString([]byte(pyScript))
-	execCmd := fmt.Sprintf("echo '%s' | base64 -d | python3 - %s", pyScriptB64, reqSpecID)
-
-	opts.TimeoutSeconds = e.clampTimeout(opts.TimeoutSeconds)
+	specB64 := base64.StdEncoding.EncodeToString(specData)
+	execCmd := fmt.Sprintf("echo '%s' | base64 -d | /usr/local/bin/sandbox-http", specB64)
 
 	var execRes *ExecResult
 	if opts.SessionID != "" {
@@ -465,43 +419,38 @@ sys.exit(proc.returncode)
 		return nil, err
 	}
 
-	statusCode := 0
-	resHeaders := make(map[string]string)
-	bodyStr := execRes.Stdout
-
-	parts := strings.SplitN(execRes.Stdout, "\r\n\r\n", 2)
-	if len(parts) < 2 {
-		parts = strings.SplitN(execRes.Stdout, "\n\n", 2)
+	var resDoc HTTPRequestResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(execRes.Stdout)), &resDoc); err != nil {
+		return nil, fmt.Errorf("failed to parse sandbox-http JSON output: %w (raw: %s)", err, execRes.Stdout)
 	}
 
-	if len(parts) >= 2 {
-		headerLines := strings.Split(parts[0], "\n")
-		if len(headerLines) > 0 {
-			headerFields := strings.Fields(headerLines[0])
-			if len(headerFields) >= 2 {
-				statusCode, _ = strconv.Atoi(headerFields[1])
-			}
+	if e.auditLogger != nil {
+		sanitizedURL := opts.URL
+		if u, err := url.Parse(opts.URL); err == nil && u.User != nil {
+			u.User = url.UserPassword("[REDACTED]", "[REDACTED]")
+			sanitizedURL = u.String()
 		}
-		for _, line := range headerLines[1:] {
-			kv := strings.SplitN(line, ":", 2)
-			if len(kv) == 2 {
-				resHeaders[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-			}
-		}
-		bodyStr = parts[1]
+
+		bodyHash := sha256.Sum256([]byte(opts.Body))
+
+		_ = e.auditLogger.Log(audit.Event{
+			SessionID:     opts.SessionID,
+			Interface:     "engine",
+			ToolOrCommand: "sandbox_http_request",
+			AuditMode:     audit.AuditMetadataOnly,
+			DurationMS:    execRes.DurationMS,
+			ExitCode:      &resDoc.CurlExitCode,
+			Details: map[string]interface{}{
+				"method":      opts.Method,
+				"url":         sanitizedURL,
+				"status":      resDoc.StatusCode,
+				"body_bytes":  len(opts.Body),
+				"body_sha256": hex.EncodeToString(bodyHash[:]),
+			},
+		})
 	}
 
-	return &HTTPRequestResult{
-		RequestedURL:           opts.URL,
-		ConnectionHost:         connectionHost,
-		HostGatewayTranslation: gatewayTranslation,
-		StatusCode:             statusCode,
-		Headers:                resHeaders,
-		Body:                   bodyStr,
-		DurationMS:             execRes.DurationMS,
-		CurlExitCode:           execRes.ExitCode,
-		Truncated:              execRes.StdoutTruncated,
-	}, nil
+	return &resDoc, nil
 }
 
 type ReadResult struct {
@@ -533,6 +482,20 @@ func (e *Engine) ReadFile(ctx context.Context, sessID, containerPath string, off
 	if binaryEncoding == "base64" {
 		content = base64.StdEncoding.EncodeToString([]byte(res.Stdout))
 		encoding = "base64"
+	}
+
+	if e.auditLogger != nil {
+		_ = e.auditLogger.Log(audit.Event{
+			SessionID:     sessID,
+			Interface:     "engine",
+			ToolOrCommand: "sandbox_read_file",
+			AuditMode:     audit.AuditMetadataOnly,
+			Details: map[string]interface{}{
+				"path":       cleanPath,
+				"bytes_read": len(res.Stdout),
+				"offset":     offset,
+			},
+		})
 	}
 
 	return &ReadResult{
@@ -568,11 +531,32 @@ func (e *Engine) WriteFile(ctx context.Context, sessID, scratchPath, content, en
 
 	cmd := fmt.Sprintf("echo '%s' | base64 -d | /usr/local/bin/sandbox-fs write '%s' %s", b64Data, cleanPath, overwriteStr)
 	res, err := e.Exec(ctx, sessID, cmd, "/scratch", 15, nil)
-	if err != nil || res.ExitCode != 0 {
+	if err != nil || (res != nil && res.ExitCode != 0) {
 		if res != nil && res.ExitCode == 17 {
 			return nil, fmt.Errorf("file '%s' already exists and overwrite is false", cleanPath)
 		}
-		return nil, fmt.Errorf("sandbox-fs write failed for '%s': %s", cleanPath, res.Stderr)
+		stderrMsg := ""
+		if res != nil {
+			stderrMsg = res.Stderr
+		}
+		return nil, fmt.Errorf("sandbox-fs write failed for '%s': %v (stderr: %s)", cleanPath, err, stderrMsg)
+	}
+
+	contentHash := sha256.Sum256([]byte(content))
+
+	if e.auditLogger != nil {
+		_ = e.auditLogger.Log(audit.Event{
+			SessionID:     sessID,
+			Interface:     "engine",
+			ToolOrCommand: "sandbox_write_file",
+			AuditMode:     audit.AuditMetadataOnly,
+			Details: map[string]interface{}{
+				"path":           cleanPath,
+				"bytes_written":  len(content),
+				"content_sha256": hex.EncodeToString(contentHash[:]),
+				"overwrite":      overwrite,
+			},
+		})
 	}
 
 	return &WriteResult{
@@ -638,19 +622,45 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 		return nil, fmt.Errorf("export denied for path '%s': %w", scratchPath, err)
 	}
 
+	// Verify regular file via sandbox-fs stat before export
+	statCmd := fmt.Sprintf("/usr/local/bin/sandbox-fs stat '%s'", cleanScratch)
+	statRes, err := e.Exec(ctx, sessID, statCmd, "/scratch", 10, nil)
+	if err != nil || statRes.ExitCode != 0 {
+		return nil, fmt.Errorf("failed to stat export source file '%s': %v", cleanScratch, err)
+	}
+
+	var statObj map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(statRes.Stdout)), &statObj); err != nil {
+		return nil, fmt.Errorf("failed to parse sandbox-fs stat output: %w", err)
+	}
+
+	if isRegular, ok := statObj["is_regular"].(bool); !ok || !isRegular {
+		return nil, fmt.Errorf("export source '%s' is not a regular file", cleanScratch)
+	}
+
+	fileSizeFloat, _ := statObj["size"].(float64)
+	if int64(fileSizeFloat) > e.cfg.Limits.MaximumExportBytes {
+		return nil, fmt.Errorf("file size %d exceeds maximum export limit %d", int64(fileSizeFloat), e.cfg.Limits.MaximumExportBytes)
+	}
+
 	if destName == "" {
 		destName = path.Base(cleanScratch)
 	}
-	if strings.ContainsAny(destName, "/\\..") {
-		return nil, fmt.Errorf("invalid destination name '%s'", destName)
-	}
-
+	destName = filepath.Base(filepath.Clean(destName))
 	sess, err := e.sessMgr.GetSession(sessID)
 	if err != nil {
 		return nil, err
 	}
 
+	// Duplicate-safe destination naming
 	hostDest := filepath.Join(e.cfg.ExportDir, destName)
+	if _, err := os.Stat(hostDest); err == nil {
+		ext := filepath.Ext(destName)
+		base := strings.TrimSuffix(destName, ext)
+		destName = fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext)
+		hostDest = filepath.Join(e.cfg.ExportDir, destName)
+	}
+
 	cleanDest, err := pathsafe.ValidateHostPathUnderRoot(hostDest, e.cfg.ExportDir)
 	if err != nil {
 		return nil, fmt.Errorf("export destination path unsafe: %w", err)
@@ -683,31 +693,48 @@ func (e *Engine) StopSession(ctx context.Context, sessID string) error {
 		return err
 	}
 
-	// Verify resource ownership before destructive removal; abort if verification fails
+	// Verify resource ownership before destructive removal; ABORT IF VERIFICATION FAILS
 	if err := e.dockerClient.VerifyResourceOwnership(ctx, sess.ComposeProject, sess.ID); err != nil {
-		sess.CleanupState = "cleanup-failed"
-		_ = e.sessMgr.Transition(sessID, "", session.StateCleanupFailed)
+		_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
+			s.Status = session.StateCleanupFailed
+			s.CleanupState = "cleanup-failed"
+			s.CleanupError = err.Error()
+			s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
+		})
 		return fmt.Errorf("ownership verification failed for session %s: %w", sessID, err)
 	}
 
 	_ = e.sessMgr.Transition(sessID, "", session.StateStopping)
 
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.cfg.Limits.ShutdownGraceSeconds)*time.Second)
 	defer cancel()
 
 	if err := e.dockerClient.ComposeDown(cleanupCtx, sess.ComposeProject, sess.ComposeFilePath); err != nil {
-		sess.CleanupState = "cleanup-failed"
-		_ = e.sessMgr.Transition(sessID, "", session.StateCleanupFailed)
+		_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
+			s.Status = session.StateCleanupFailed
+			s.CleanupState = "cleanup-failed"
+			s.CleanupError = err.Error()
+			s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
+		})
 		return fmt.Errorf("failed to stop session containers: %w", err)
 	}
 
-	_ = e.sessMgr.RemoveSession(sessID)
+	if err := e.sessMgr.RemoveSession(sessID); err != nil {
+		_ = e.sessMgr.UpdateSessionState(sessID, func(s *session.Session) {
+			s.Status = session.StateCleanupFailed
+			s.CleanupState = "cleanup-failed"
+			s.CleanupError = err.Error()
+			s.CleanupTimestamp = time.Now().UTC().Format(time.RFC3339)
+		})
+		return fmt.Errorf("failed to remove session state directory: %w", err)
+	}
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
 			SessionID:     sessID,
 			Interface:     "engine",
 			ToolOrCommand: "sandbox_stop",
+			AuditMode:     audit.AuditMetadataOnly,
 		})
 	}
 
@@ -723,8 +750,13 @@ func (e *Engine) ResetSession(ctx context.Context, sessID string) (*StartResult,
 		hostAccess = sess.HostGatewayEnabled
 	}
 
-	_ = e.StopSession(ctx, sessID)
-	return e.StartSession(ctx, outbound, hostAccess, e.cfg.Limits.DefaultSessionTTLMinutes)
+	if err := e.StopSession(ctx, sessID); err != nil {
+		return nil, fmt.Errorf("cannot reset session: StopSession failed: %w", err)
+	}
+
+	outboundPtr := &outbound
+	hostAccessPtr := &hostAccess
+	return e.StartSession(ctx, outboundPtr, hostAccessPtr, e.cfg.Limits.DefaultSessionTTLMinutes)
 }
 
 func (e *Engine) GetAuditSummary(sessionID string, limit int) ([]audit.Event, error) {
@@ -732,6 +764,19 @@ func (e *Engine) GetAuditSummary(sessionID string, limit int) ([]audit.Event, er
 		return []audit.Event{}, nil
 	}
 	return e.auditLogger.GetSummaryForSession(sessionID, limit)
+}
+
+func (e *Engine) resolveNetworkPolicy(requested *bool, globalConfig bool, name string) (bool, error) {
+	if requested == nil {
+		return globalConfig, nil
+	}
+	if !*requested {
+		return false, nil
+	}
+	if *requested && globalConfig {
+		return true, nil
+	}
+	return false, fmt.Errorf("%w: requested %s=true, but global policy is false", ErrPolicyDenied, name)
 }
 
 func (e *Engine) clampTimeout(userTimeout int) int {

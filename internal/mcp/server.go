@@ -149,9 +149,9 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 
 	case "sandbox_start":
 		var p struct {
-			OutboundNetwork bool `json:"outbound_network"`
-			HostAccess      bool `json:"host_access"`
-			TTLMinutes      int  `json:"ttl_minutes"`
+			OutboundNetwork *bool `json:"outbound_network"`
+			HostAccess      *bool `json:"host_access"`
+			TTLMinutes      int   `json:"ttl_minutes"`
 		}
 		_ = json.Unmarshal(args, &p)
 		return s.engine.StartSession(ctx, p.OutboundNetwork, p.HostAccess, p.TTLMinutes)

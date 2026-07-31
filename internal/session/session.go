@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -19,7 +20,7 @@ var (
 	ErrSessionNotFound        = errors.New("session not found")
 	ErrInvalidStateTransition = errors.New("invalid session state transition")
 	ErrSessionLimitReached    = errors.New("maximum active session limit reached")
-	ErrConcurrentExecLimit    = errors.New("concurrent command execution limit reached for session")
+	ErrConcurrentExecLimit    = errors.New("concurrent command execution limit reached")
 )
 
 type Mode string
@@ -52,9 +53,13 @@ type Session struct {
 	ExpiresAt          time.Time             `json:"expires_at"`
 	Status             State                 `json:"status"`
 	RunnerContainerID  string                `json:"runner_container_id,omitempty"`
+	NetworkID          string                `json:"network_id,omitempty"`
+	VolumeName         string                `json:"volume_name,omitempty"`
 	ScratchVolumeName  string                `json:"scratch_volume_name"`
 	ActiveExecCount    int                   `json:"active_exec_count"`
 	CleanupState       string                `json:"cleanup_state"`
+	CleanupError       string                `json:"cleanup_error,omitempty"`
+	CleanupTimestamp   string                `json:"cleanup_timestamp,omitempty"`
 	OutboundEnabled    bool                  `json:"outbound_enabled"`
 	HostGatewayEnabled bool                  `json:"host_gateway_enabled"`
 	NetworkPolicy      config.NetworkConfig  `json:"network_policy"`
@@ -62,11 +67,12 @@ type Session struct {
 }
 
 type Manager struct {
-	mu        sync.Mutex
-	cfg       *config.Config
-	sessions  map[string]*Session
-	stateDir  string
-	execLocks map[string]*sync.Mutex
+	mu          sync.Mutex
+	cfg         *config.Config
+	sessions    map[string]*Session
+	stateDir    string
+	globalSem   chan struct{}
+	sessionSems map[string]chan struct{}
 }
 
 func GenerateSessionID() (string, error) {
@@ -84,11 +90,17 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create session state dir: %w", err)
 	}
 
+	globalLimit := cfg.Limits.MaximumParallelGlobalExec
+	if globalLimit <= 0 {
+		globalLimit = 4
+	}
+
 	m := &Manager{
-		cfg:       cfg,
-		sessions:  make(map[string]*Session),
-		stateDir:  sessionsDir,
-		execLocks: make(map[string]*sync.Mutex),
+		cfg:         cfg,
+		sessions:    make(map[string]*Session),
+		stateDir:    sessionsDir,
+		globalSem:   make(chan struct{}, globalLimit),
+		sessionSems: make(map[string]chan struct{}),
 	}
 
 	if err := m.loadSavedSessions(); err != nil {
@@ -140,6 +152,11 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, host
 	netPolicy.OutboundEnabled = outboundEnabled
 	netPolicy.HostGatewayEnabled = hostGatewayEnabled
 
+	sessLimit := m.cfg.Limits.MaximumParallelExecPerSession
+	if sessLimit <= 0 {
+		sessLimit = 1
+	}
+
 	s := &Session{
 		ID:                 id,
 		Mode:               mode,
@@ -149,6 +166,7 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, host
 		ExpiresAt:          now.Add(ttl),
 		Status:             StateCreated,
 		ScratchVolumeName:  scratchVolName,
+		VolumeName:         scratchVolName,
 		CleanupState:       "none",
 		OutboundEnabled:    outboundEnabled,
 		HostGatewayEnabled: hostGatewayEnabled,
@@ -157,15 +175,55 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, host
 	}
 
 	m.sessions[id] = s
-	m.execLocks[id] = &sync.Mutex{}
+	m.sessionSems[id] = make(chan struct{}, sessLimit)
 
 	if err := m.saveSessionLocked(s); err != nil {
 		delete(m.sessions, id)
-		delete(m.execLocks, id)
+		delete(m.sessionSems, id)
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// AcquireExecSemaphores acquires both global and per-session execution slots atomically with context cancellation.
+func (m *Manager) AcquireExecSemaphores(ctx context.Context, id string) (func(), error) {
+	m.mu.Lock()
+	sessSem, ok := m.sessionSems[id]
+	if !ok {
+		sessLimit := m.cfg.Limits.MaximumParallelExecPerSession
+		if sessLimit <= 0 {
+			sessLimit = 1
+		}
+		sessSem = make(chan struct{}, sessLimit)
+		m.sessionSems[id] = sessSem
+	}
+	m.mu.Unlock()
+
+	// Acquire global semaphore
+	select {
+	case m.globalSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	// Acquire session semaphore
+	select {
+	case sessSem <- struct{}{}:
+	case <-ctx.Done():
+		<-m.globalSem
+		return nil, ctx.Err()
+	}
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			<-sessSem
+			<-m.globalSem
+		})
+	}
+
+	return release, nil
 }
 
 func (m *Manager) GetSession(id string) (*Session, error) {
@@ -182,21 +240,36 @@ func (m *Manager) GetSession(id string) (*Session, error) {
 		_ = m.saveSessionLocked(s)
 	}
 
-	return s, nil
+	// Return defensive copy
+	cp := *s
+	return &cp, nil
 }
 
-func (m *Manager) ListSessions() []*Session {
+func (m *Manager) UpdateSessionState(id string, updateFn func(s *Session)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	list := make([]*Session, 0, len(m.sessions))
+	s, ok := m.sessions[id]
+	if !ok {
+		return fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
+	}
+
+	updateFn(s)
+	return m.saveSessionLocked(s)
+}
+
+func (m *Manager) ListSessions() []Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	list := make([]Session, 0, len(m.sessions))
 	now := time.Now().UTC()
 	for _, s := range m.sessions {
 		if now.After(s.ExpiresAt) && (s.Status == StateReady || s.Status == StateCreated) {
 			s.Status = StateExpired
 			_ = m.saveSessionLocked(s)
 		}
-		list = append(list, s)
+		list = append(list, *s)
 	}
 	return list
 }
@@ -234,6 +307,7 @@ func (m *Manager) SetActiveExecCount(id string, delta int) error {
 	return m.saveSessionLocked(s)
 }
 
+// RemoveSession is transactional: returns error if state dir deletion fails and keeps in-memory state.
 func (m *Manager) RemoveSession(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -243,23 +317,13 @@ func (m *Manager) RemoveSession(id string) error {
 	}
 
 	sessDir := filepath.Join(m.stateDir, id)
-	_ = os.RemoveAll(sessDir)
+	if err := os.RemoveAll(sessDir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete session state directory: %w", err)
+	}
 
 	delete(m.sessions, id)
-	delete(m.execLocks, id)
+	delete(m.sessionSems, id)
 	return nil
-}
-
-func (m *Manager) GetExecLock(id string) (*sync.Mutex, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	lock, ok := m.execLocks[id]
-	if !ok {
-		lock = &sync.Mutex{}
-		m.execLocks[id] = lock
-	}
-	return lock, nil
 }
 
 func (m *Manager) saveSessionLocked(s *Session) error {
@@ -294,6 +358,11 @@ func (m *Manager) loadSavedSessions() error {
 		return err
 	}
 
+	sessLimit := m.cfg.Limits.MaximumParallelExecPerSession
+	if sessLimit <= 0 {
+		sessLimit = 1
+	}
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -310,7 +379,7 @@ func (m *Manager) loadSavedSessions() error {
 			cleanID, err := pathsafe.CleanHostPath(sess.ID)
 			if err == nil && cleanID == sess.ID {
 				m.sessions[sess.ID] = &sess
-				m.execLocks[sess.ID] = &sync.Mutex{}
+				m.sessionSems[sess.ID] = make(chan struct{}, sessLimit)
 			}
 		}
 	}

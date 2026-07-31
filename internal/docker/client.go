@@ -26,6 +26,7 @@ type Client interface {
 	ComposeUp(ctx context.Context, projectName, composeFilePath string) error
 	ComposeDown(ctx context.Context, projectName, composeFilePath string) error
 	ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
+	ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
 	CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error
 	ListManagedResources(ctx context.Context) ([]string, error)
 	VerifyResourceOwnership(ctx context.Context, projectName, sessionID string) error
@@ -112,6 +113,7 @@ func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, se
 		return fmt.Errorf("%w: invalid compose project prefix '%s', expected 'sandbox_'", ErrResourceMismatch, projectName)
 	}
 
+	// Verify Runner Container
 	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "ps", "-a",
 		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
 		"--filter", "label=ai.security.lab-runner.managed=true",
@@ -119,22 +121,64 @@ func (c *CLIClient) VerifyResourceOwnership(ctx context.Context, projectName, se
 		"--format", "{{.ID}}",
 	)
 	if err != nil || exitCode != 0 || strings.TrimSpace(stdout) == "" {
-		return fmt.Errorf("%w: verified session label %s not found on active containers (stderr: %s)", ErrResourceMismatch, sessionID, stderr)
+		return fmt.Errorf("%w: verified session container label %s not found on active containers (stderr: %s)", ErrResourceMismatch, sessionID, stderr)
 	}
+
+	// Verify Network
+	stdoutNet, _, exitCodeNet, errNet := c.runDockerCmd(ctx, "network", "ls",
+		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
+		"--filter", "label=ai.security.lab-runner.managed=true",
+		"--filter", "label=ai.security.lab-runner.kind=sandbox-network",
+		"--format", "{{.ID}}",
+	)
+	if errNet != nil || exitCodeNet != 0 || strings.TrimSpace(stdoutNet) == "" {
+		return fmt.Errorf("%w: verified session network label %s not found", ErrResourceMismatch, sessionID)
+	}
+
+	// Verify Volume
+	stdoutVol, _, exitCodeVol, errVol := c.runDockerCmd(ctx, "volume", "ls",
+		"--filter", fmt.Sprintf("label=ai.security.lab-runner.session=%s", sessionID),
+		"--filter", "label=ai.security.lab-runner.managed=true",
+		"--filter", "label=ai.security.lab-runner.kind=sandbox-scratch",
+		"--format", "{{.Name}}",
+	)
+	if errVol != nil || exitCodeVol != 0 || strings.TrimSpace(stdoutVol) == "" {
+		return fmt.Errorf("%w: verified session volume label %s not found", ErrResourceMismatch, sessionID)
+	}
+
 	return nil
 }
 
 func (c *CLIClient) ComposeDown(ctx context.Context, projectName, composeFilePath string) error {
-	_, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "down", "-v", "--remove-orphans")
+	stdout, stderr, exitCode, err := c.runDockerCmd(ctx, "compose", "-p", projectName, "-f", composeFilePath, "down", "-v", "--remove-orphans")
 	if err != nil || exitCode != 0 {
-		return fmt.Errorf("%w: docker compose down failed (exit code %d): %s", ErrDockerExecFailed, exitCode, stderr)
+		// Verify if containers are actually gone
+		psOut, _, _, _ := c.runDockerCmd(ctx, "ps", "-a", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", projectName), "--format", "{{.ID}}")
+		if strings.TrimSpace(psOut) == "" {
+			return nil // Resources successfully removed despite compose warning
+		}
+		return fmt.Errorf("%w: docker compose down failed (exit code %d): %s (stdout: %s)", ErrDockerExecFailed, exitCode, stderr, stdout)
 	}
 	return nil
 }
 
-// Invariant 2 & Internal Timeout Enforcement: Wrap command with internal GNU timeout inside runner container.
+// ExecInRunner executes an agent command string inside the runner container using Docker CLI argument arrays without shell interpolation on host.
 func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, agentCmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	// Give controller host command context a small grace period beyond internal timeout
+	timeoutSec := int(timeout.Seconds())
+	if timeoutSec <= 0 {
+		timeoutSec = 30
+	}
+
+	argv := []string{
+		"timeout", "--signal=TERM", "--kill-after=2s", fmt.Sprintf("%ds", timeoutSec),
+		"bash", "-lc", agentCmd,
+	}
+
+	return c.ExecArgvInRunner(ctx, projectName, composeFilePath, cwd, argv, env, timeout, maxOutputBytes)
+}
+
+// ExecArgvInRunner executes a raw string slice argument vector directly inside the runner container.
+func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
 	hostTimeout := timeout + 5*time.Second
 	if timeout <= 0 {
 		hostTimeout = 35 * time.Second
@@ -152,14 +196,8 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
 
-	// Internal GNU timeout inside runner container
-	timeoutSec := int(timeout.Seconds())
-	if timeoutSec <= 0 {
-		timeoutSec = 30
-	}
-	wrappedCmd := fmt.Sprintf("timeout --signal=TERM --kill-after=2s %ds bash -lc %q", timeoutSec, agentCmd)
-
-	args = append(args, "runner", "sh", "-c", wrappedCmd)
+	args = append(args, "runner")
+	args = append(args, argv...)
 
 	cmd := exec.CommandContext(execCtx, c.dockerBin, args...)
 
@@ -175,14 +213,14 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 		var exitErr *exec.ExitError
 		if errors.As(execErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
-			if exitCode == 124 || exitCode == 137 {
+			if exitCode == 124 {
 				timedOut = true
 			}
 		} else if execCtx.Err() == context.DeadlineExceeded {
 			timedOut = true
 			exitCode = 124
 		} else {
-			exitCode = -1
+			return -1, "", "", false, false, fmt.Errorf("%w: docker execution system error: %v", ErrDockerExecFailed, execErr)
 		}
 	}
 

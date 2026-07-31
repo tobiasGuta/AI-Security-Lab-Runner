@@ -32,11 +32,11 @@ func GetDefinedTools() []Tool {
 				Properties: map[string]SchemaProperty{
 					"outbound_network": {
 						Type:        "boolean",
-						Description: "Enable outbound internet access.",
+						Description: "Enable outbound internet access (optional pointer; true subject to global policy ceiling).",
 					},
 					"host_access": {
 						Type:        "boolean",
-						Description: "Enable host gateway mapping for accessing host-published applications.",
+						Description: "Enable host gateway mapping for accessing host-published applications (optional pointer; true subject to global policy ceiling).",
 					},
 					"ttl_minutes": {
 						Type:        "integer",
@@ -73,7 +73,7 @@ func GetDefinedTools() []Tool {
 		},
 		{
 			Name:        "sandbox_http_request",
-			Description: "Make a structured HTTP/HTTPS request inside the sandbox. Loopback URLs (localhost/127.0.0.1) automatically map to host-published services.",
+			Description: "Make a structured HTTP/HTTPS request inside the sandbox using trusted sandbox-http helper. Loopback URLs (localhost/127.0.0.1) automatically map to host-published services.",
 			InputSchema: ToolSchema{
 				Type: "object",
 				Properties: map[string]SchemaProperty{
@@ -99,11 +99,11 @@ func GetDefinedTools() []Tool {
 					},
 					"follow_redirects": {
 						Type:        "boolean",
-						Description: "Follow HTTP redirects (-L).",
+						Description: "Follow HTTP redirects.",
 					},
 					"insecure_tls": {
 						Type:        "boolean",
-						Description: "Allow insecure TLS certificates (-k).",
+						Description: "Allow insecure TLS certificates.",
 					},
 					"timeout_seconds": {
 						Type:        "integer",

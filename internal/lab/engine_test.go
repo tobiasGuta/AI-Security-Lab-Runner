@@ -24,7 +24,10 @@ func (m *MockDockerClient) ComposeDown(ctx context.Context, projectName, compose
 	return nil
 }
 func (m *MockDockerClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	return 0, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}", "", false, false, nil
+	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, nil
+}
+func (m *MockDockerClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
+	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, nil
 }
 func (m *MockDockerClient) CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error {
 	return os.WriteFile(hostDestPath, []byte("mock export data"), 0644)
@@ -51,7 +54,8 @@ func TestSandboxEngineStartAndRequest(t *testing.T) {
 		t.Fatalf("NewEngine failed: %v", err)
 	}
 
-	startRes, err := eng.StartSession(context.Background(), true, true, 60)
+	truePtr := true
+	startRes, err := eng.StartSession(context.Background(), &truePtr, &truePtr, 60)
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}

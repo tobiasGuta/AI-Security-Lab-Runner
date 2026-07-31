@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const scratchRoot = "/scratch"
@@ -43,7 +44,7 @@ func cmdRead(args []string) {
 	}
 
 	p := args[0]
-	f, cleanPath, err := openScratchPathFd(p, os.O_RDONLY, 0)
+	f, cleanPath, err := openScratchPathFd(p, syscall.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
@@ -107,34 +108,35 @@ func cmdWrite(args []string) {
 		os.Exit(2)
 	}
 
-	dir := filepath.Dir(cleaned)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create directory: %v\n", err)
+	// Create intermediate parent directories descriptor-relatively using mkdirat
+	if err := mkdiratScratchPath(cleaned); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create parent directories descriptor-relatively: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Check if target exists using descriptor-relative O_NOFOLLOW
-	if f, _, err := openScratchPathFd(cleaned, os.O_RDONLY, 0); err == nil {
-		info, _ := f.Stat()
-		_ = f.Close()
-		if info != nil && !info.Mode().IsRegular() {
-			fmt.Fprintf(os.Stderr, "Error: '%s' is not a regular file\n", cleaned)
-			os.Exit(2)
-		}
-		if !overwrite {
+	var flags int
+	if overwrite {
+		flags = syscall.O_CREAT | syscall.O_WRONLY | syscall.O_TRUNC
+	} else {
+		flags = syscall.O_CREAT | syscall.O_WRONLY | syscall.O_EXCL
+	}
+
+	f, cleanPath, err := openScratchPathFd(cleaned, flags, 0644)
+	if err != nil {
+		if os.IsExist(err) || strings.Contains(err.Error(), "exist") {
 			fmt.Fprintf(os.Stderr, "Error: file '%s' already exists and overwrite is false\n", cleaned)
 			os.Exit(17)
 		}
-	}
-
-	// Write directly via descriptor-relative O_CREATE | O_WRONLY | O_TRUNC
-	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-	f, _, err := openScratchPathFd(cleaned, flags, 0644)
-	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
 	}
 	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		fmt.Fprintf(os.Stderr, "Error: '%s' is not a regular file\n", cleanPath)
+		os.Exit(2)
+	}
 
 	n, err := io.Copy(f, os.Stdin)
 	if err != nil {
@@ -152,7 +154,7 @@ func cmdStat(args []string) {
 	}
 
 	p := args[0]
-	f, cleanPath, err := openScratchPathFd(p, os.O_RDONLY, 0)
+	f, cleanPath, err := openScratchPathFd(p, syscall.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)
@@ -186,7 +188,7 @@ func cmdHash(args []string) {
 	}
 
 	p := args[0]
-	f, cleanPath, err := openScratchPathFd(p, os.O_RDONLY, 0)
+	f, cleanPath, err := openScratchPathFd(p, syscall.O_RDONLY, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security Violation: %v\n", err)
 		os.Exit(2)

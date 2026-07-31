@@ -9,10 +9,19 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/pathsafe"
+)
+
+type AuditMode string
+
+const (
+	AuditCommand      AuditMode = "command"
+	AuditMetadataOnly AuditMode = "metadata_only"
+	AuditDisabled     AuditMode = "disabled"
 )
 
 var (
@@ -20,8 +29,12 @@ var (
 
 	secretPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(authorization:\s*)(bearer|basic)\s+[a-zA-Z0-9._~+/-]+=*`),
+		regexp.MustCompile(`(?i)(proxy-authorization:\s*)(bearer|basic)\s+[a-zA-Z0-9._~+/-]+=*`),
 		regexp.MustCompile(`(?i)(cookie:\s*)[^\r\n]+`),
+		regexp.MustCompile(`(?i)(set-cookie:\s*)[^\r\n]+`),
 		regexp.MustCompile(`(?i)(api[_-]?key|secret|password|token|auth_token)\s*[:=]\s*["']?[a-zA-Z0-9._~+/-]+["']?`),
+		regexp.MustCompile(`(?i)([?&](password|token|secret|api_key|key)=)[^&\s]+`),
+		regexp.MustCompile(`(?i)(https?://)[^:]+:[^@]+@`), // URL userinfo
 		regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`),
 		regexp.MustCompile(`(?i)(AKIA[0-9A-Z]{16})`),
 	}
@@ -31,8 +44,9 @@ type Event struct {
 	Timestamp       string                 `json:"timestamp"`
 	EventID         string                 `json:"event_id"`
 	SessionID       string                 `json:"session_id,omitempty"`
-	Interface       string                 `json:"interface"` // "mcp" or "cli"
+	Interface       string                 `json:"interface"` // "mcp", "cli", or "engine"
 	ToolOrCommand   string                 `json:"tool_or_command"`
+	AuditMode       AuditMode              `json:"audit_mode,omitempty"`
 	DurationMS      int64                  `json:"duration_ms,omitempty"`
 	ExitCode        *int                   `json:"exit_code,omitempty"`
 	TimedOut        bool                   `json:"timed_out,omitempty"`
@@ -80,6 +94,10 @@ func (l *Logger) Log(event Event) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if event.AuditMode == AuditDisabled {
+		return nil
+	}
+
 	if event.Timestamp == "" {
 		event.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -87,15 +105,26 @@ func (l *Logger) Log(event Event) error {
 		event.EventID = GenerateEventID()
 	}
 
-	if l.redactSecrets {
+	// In AuditMetadataOnly mode, clear raw command output / body payloads
+	if event.AuditMode == AuditMetadataOnly {
+		event.RedactedCommand = "[METADATA_ONLY]"
+	} else if l.redactSecrets {
 		event.RedactedCommand = l.Redact(event.RedactedCommand)
-		if event.Details != nil {
-			for k, v := range event.Details {
-				if strVal, ok := v.(string); ok {
-					event.Details[k] = l.Redact(strVal)
-				}
+	}
+
+	if l.redactSecrets && event.Details != nil {
+		sanitizedDetails := make(map[string]interface{})
+		for k, v := range event.Details {
+			lk := strings.ToLower(k)
+			if lk == "content" || lk == "body" || lk == "payload" || lk == "base64" {
+				sanitizedDetails[k] = "[PAYLOAD_REDACTED]"
+			} else if strVal, ok := v.(string); ok {
+				sanitizedDetails[k] = l.Redact(strVal)
+			} else {
+				sanitizedDetails[k] = v
 			}
 		}
+		event.Details = sanitizedDetails
 	}
 
 	data, err := json.Marshal(event)
