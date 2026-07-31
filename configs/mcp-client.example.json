@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "security-lab-runner": {
+      "command": "/opt/ai-security-lab-runner/lab-runner",
+      "args": [
+        "serve",
+        "--config",
+        "/etc/ai-security-lab-runner/config.yaml"
+      ]
+    }
+  }
+}

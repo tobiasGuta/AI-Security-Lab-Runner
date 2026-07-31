@@ -1,0 +1,18 @@
+# Binaries
+lab-runner
+lab-runner.exe
+*.exe
+*.exe.test
+*.out
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test & state artifacts
+.ai-security-lab-runner/
+audit.jsonl
+exports/
+sessions/

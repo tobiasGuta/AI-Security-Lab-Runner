@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "security-lab-runner": {
+      "command": "C:\\Tools\\Lab-Runner\\lab-runner.exe",
+      "args": [
+        "serve",
+        "--config",
+        "C:\\Tools\\Lab-Runner\\config.yaml"
+      ]
+    }
+  }
+}

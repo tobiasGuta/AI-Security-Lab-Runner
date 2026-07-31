@@ -1,0 +1,35 @@
+version: 1
+name: "hello-web-lab"
+description: "Local example target for validating the runner"
+
+workspace: "."
+
+targets:
+  - name: "target"
+    build:
+      context: "."
+      dockerfile: "Dockerfile"
+    internal_port: 3000
+    healthcheck:
+      url: "http://target:3000/health"
+      timeout_seconds: 30
+      interval_seconds: 1
+    environment:
+      NODE_ENV: "development"
+
+host_access:
+  publish: false
+  bind_address: "127.0.0.1"
+  requested_ports: {}
+
+limits:
+  target_memory: "512m"
+  target_cpus: 0.75
+  target_pids: 128
+  runner_memory: "1g"
+  runner_cpus: 1.0
+  runner_pids: 256
+
+runner:
+  workspace_mount: "."
+  scratch_persistent: false
