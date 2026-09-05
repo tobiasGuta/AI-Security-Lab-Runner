@@ -3,11 +3,11 @@ package lab
 // TranscriptSettings exposes only the configuration required by transport-level
 // observability. It intentionally does not expose the full engine configuration.
 type TranscriptSettings struct {
-	StateDir            string
-	IncludeCommands     bool
+	StateDir             string
+	IncludeCommands      bool
 	IncludeCommandOutput bool
-	RedactSecrets       bool
-	MaximumOutputBytes  int64
+	RedactSecrets        bool
+	MaximumOutputBytes   int64
 }
 
 func (e *Engine) GetTranscriptSettings() TranscriptSettings {
