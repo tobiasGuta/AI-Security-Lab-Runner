@@ -30,6 +30,12 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
+      # Several unit/integration packages exercise real runner containers and
+      # validate the image version. Build the local image before those tests so
+      # a fresh GitHub-hosted runner has the dependency they require.
+      - name: Build Runner Container Image
+        run: docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/
+
       - name: Go Unit Tests
         run: go test -v ./...
 
@@ -38,9 +44,6 @@ jobs:
 
       - name: Build Executable Binary
         run: go build -o lab-runner ./cmd/lab-runner
-
-      - name: Build Runner Container Image
-        run: docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/
 
       - name: Infrastructure Health Check (Doctor)
         run: ./lab-runner doctor
