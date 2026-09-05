@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -23,7 +24,26 @@ type Server struct {
 }
 
 func NewServer(engine *lab.Engine, in io.Reader, out io.Writer) *Server {
-	return NewServerWithTranscript(engine, in, out, nil)
+	var transcriptStore *transcript.Store
+	if engine != nil {
+		settings := engine.GetTranscriptSettings()
+		maxTranscriptOutput := settings.MaximumOutputBytes
+		if maxTranscriptOutput <= 0 || maxTranscriptOutput > 256*1024 {
+			maxTranscriptOutput = 256 * 1024
+		}
+		store, err := transcript.NewStore(filepath.Join(settings.StateDir, "transcripts"), transcript.Options{
+			IncludeCommands: settings.IncludeCommands,
+			IncludeOutput:   settings.IncludeCommandOutput,
+			RedactSecrets:   settings.RedactSecrets,
+			MaxOutputBytes:  maxTranscriptOutput,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[lab-runner] warning: execution transcript disabled: %v\n", err)
+		} else {
+			transcriptStore = store
+		}
+	}
+	return NewServerWithTranscript(engine, in, out, transcriptStore)
 }
 
 func NewServerWithTranscript(engine *lab.Engine, in io.Reader, out io.Writer, transcriptStore *transcript.Store) *Server {
@@ -283,9 +303,9 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 
 	case "sandbox_get_logs":
 		var p struct {
-			SessionID    string `json:"session_id"`
-			AfterEventID string `json:"after_event_id"`
-			Limit        int    `json:"limit"`
+			SessionID     string `json:"session_id"`
+			AfterEventID  string `json:"after_event_id"`
+			Limit         int    `json:"limit"`
 			IncludeOutput bool   `json:"include_output"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil {
