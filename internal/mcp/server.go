@@ -8,18 +8,25 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/lab"
+	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/transcript"
 )
 
 type Server struct {
-	mu     sync.Mutex
-	engine *lab.Engine
-	in     io.Reader
-	out    io.Writer
+	mu              sync.Mutex
+	engine          *lab.Engine
+	in              io.Reader
+	out             io.Writer
+	transcriptStore *transcript.Store
 }
 
 func NewServer(engine *lab.Engine, in io.Reader, out io.Writer) *Server {
+	return NewServerWithTranscript(engine, in, out, nil)
+}
+
+func NewServerWithTranscript(engine *lab.Engine, in io.Reader, out io.Writer, transcriptStore *transcript.Store) *Server {
 	if in == nil {
 		in = os.Stdin
 	}
@@ -27,9 +34,10 @@ func NewServer(engine *lab.Engine, in io.Reader, out io.Writer) *Server {
 		out = os.Stdout
 	}
 	return &Server{
-		engine: engine,
-		in:     in,
-		out:    out,
+		engine:          engine,
+		in:              in,
+		out:             out,
+		transcriptStore: transcriptStore,
 	}
 }
 
@@ -113,7 +121,43 @@ func (s *Server) handleToolCall(ctx context.Context, req JSONRPCRequest) {
 		return
 	}
 
+	operationID := transcript.NewEventID()
+	sessionID, inputEvent := transcriptInputEvent(params.Name, params.Arguments)
+	if s.transcriptStore != nil && shouldRecordTranscript(params.Name) && sessionID != "" {
+		inputEvent.EventID = transcript.NewEventID()
+		inputEvent.OperationID = operationID
+		inputEvent.SessionID = sessionID
+		inputEvent.Interface = "mcp"
+		inputEvent.Tool = params.Name
+		inputEvent.Phase = "started"
+		_ = s.transcriptStore.Append(inputEvent)
+	}
+
+	startedAt := time.Now()
 	toolResult, err := s.executeTool(ctx, params.Name, params.Arguments)
+	durationMS := time.Since(startedAt).Milliseconds()
+
+	if s.transcriptStore != nil && shouldRecordTranscript(params.Name) {
+		finishSessionID := sessionID
+		if finishSessionID == "" {
+			finishSessionID = sessionIDFromResult(toolResult)
+		}
+		if finishSessionID != "" {
+			finishEvent := transcriptResultEvent(params.Name, params.Arguments, toolResult, err, durationMS)
+			finishEvent.EventID = transcript.NewEventID()
+			finishEvent.OperationID = operationID
+			finishEvent.SessionID = finishSessionID
+			finishEvent.Interface = "mcp"
+			finishEvent.Tool = params.Name
+			if err != nil {
+				finishEvent.Phase = "failed"
+			} else {
+				finishEvent.Phase = "completed"
+			}
+			_ = s.transcriptStore.Append(finishEvent)
+		}
+	}
+
 	if err != nil {
 		s.sendResult(req.ID, CallToolResult{
 			Content: []ToolContent{
@@ -237,6 +281,46 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 		}
 		return s.engine.ResetSession(ctx, p.SessionID)
 
+	case "sandbox_get_logs":
+		var p struct {
+			SessionID    string `json:"session_id"`
+			AfterEventID string `json:"after_event_id"`
+			Limit        int    `json:"limit"`
+			IncludeOutput bool   `json:"include_output"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		if s.transcriptStore == nil {
+			return map[string]interface{}{
+				"session_id":  p.SessionID,
+				"events":      []transcript.Event{},
+				"next_cursor": p.AfterEventID,
+			}, nil
+		}
+		if p.Limit <= 0 {
+			p.Limit = 50
+		}
+		if p.Limit > 200 {
+			p.Limit = 200
+		}
+		events, err := s.transcriptStore.ReadSession(p.SessionID, p.AfterEventID, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		if !p.IncludeOutput {
+			events = transcript.StripOutput(events)
+		}
+		nextCursor := p.AfterEventID
+		if len(events) > 0 {
+			nextCursor = events[len(events)-1].EventID
+		}
+		return map[string]interface{}{
+			"session_id":  p.SessionID,
+			"events":      events,
+			"next_cursor": nextCursor,
+		}, nil
+
 	case "sandbox_get_audit_summary":
 		var p struct {
 			SessionID string `json:"session_id"`
@@ -249,6 +333,162 @@ func (s *Server) executeTool(ctx context.Context, name string, args json.RawMess
 
 	default:
 		return nil, fmt.Errorf("unknown tool name '%s'", name)
+	}
+}
+
+func shouldRecordTranscript(tool string) bool {
+	switch tool {
+	case "sandbox_get_logs", "sandbox_get_audit_summary", "sandbox_status":
+		return false
+	default:
+		return true
+	}
+}
+
+func transcriptInputEvent(tool string, args json.RawMessage) (string, transcript.Event) {
+	var raw map[string]interface{}
+	_ = json.Unmarshal(args, &raw)
+
+	event := transcript.Event{}
+	sessionID, _ := raw["session_id"].(string)
+	if command, ok := raw["command"].(string); ok {
+		event.Command = command
+	}
+	if method, ok := raw["method"].(string); ok {
+		event.Method = method
+	}
+	if rawURL, ok := raw["url"].(string); ok {
+		event.URL = rawURL
+	}
+	if p, ok := raw["path"].(string); ok {
+		event.Path = p
+	} else if p, ok := raw["scratch_path"].(string); ok {
+		event.Path = p
+	}
+
+	event.Details = map[string]interface{}{}
+	switch tool {
+	case "sandbox_write_file":
+		if content, ok := raw["content"].(string); ok {
+			event.Details["content_bytes"] = len(content)
+		}
+		if overwrite, ok := raw["overwrite"].(bool); ok {
+			event.Details["overwrite"] = overwrite
+		}
+	case "sandbox_start":
+		if v, ok := raw["outbound_network"]; ok {
+			event.Details["outbound_network"] = v
+		}
+		if v, ok := raw["host_access"]; ok {
+			event.Details["host_access"] = v
+		}
+		if v, ok := raw["ttl_minutes"]; ok {
+			event.Details["ttl_minutes"] = v
+		}
+	case "sandbox_export_file":
+		if v, ok := raw["destination_name"].(string); ok {
+			event.Details["destination_name"] = v
+		}
+	}
+	if len(event.Details) == 0 {
+		event.Details = nil
+	}
+
+	return sessionID, event
+}
+
+func transcriptResultEvent(tool string, args json.RawMessage, result interface{}, toolErr error, fallbackDurationMS int64) transcript.Event {
+	_, event := transcriptInputEvent(tool, args)
+	event.DurationMS = fallbackDurationMS
+	if toolErr != nil {
+		event.Error = toolErr.Error()
+	}
+
+	var raw map[string]interface{}
+	if result != nil {
+		if data, err := json.Marshal(result); err == nil {
+			_ = json.Unmarshal(data, &raw)
+		}
+	}
+	if raw == nil {
+		return event
+	}
+
+	if duration, ok := numberAsInt(raw["duration_ms"]); ok {
+		event.DurationMS = int64(duration)
+	}
+	if exit, ok := numberAsInt(raw["exit_code"]); ok {
+		event.ExitCode = &exit
+	}
+	if status, ok := numberAsInt(raw["status_code"]); ok {
+		event.HTTPStatus = &status
+	}
+	if stdout, ok := raw["stdout"].(string); ok {
+		event.Stdout = stdout
+	}
+	if stderr, ok := raw["stderr"].(string); ok {
+		event.Stderr = stderr
+	}
+	if timedOut, ok := raw["timed_out"].(bool); ok {
+		event.TimedOut = timedOut
+	}
+	if truncated, ok := raw["truncated"].(bool); ok {
+		event.OutputTruncated = truncated
+	}
+	if truncated, ok := raw["stdout_truncated"].(bool); ok && truncated {
+		event.OutputTruncated = true
+	}
+	if truncated, ok := raw["stderr_truncated"].(bool); ok && truncated {
+		event.OutputTruncated = true
+	}
+
+	if event.Details == nil {
+		event.Details = map[string]interface{}{}
+	}
+	for _, key := range []string{"execution_mode", "status", "normalized_path", "bytes_written", "bytes", "source_path"} {
+		if value, ok := raw[key]; ok {
+			event.Details[key] = value
+		}
+	}
+	if resultSessionID, ok := raw["session_id"].(string); ok {
+		inputSessionID, _ := transcriptInputEvent(tool, args)
+		if inputSessionID != "" && resultSessionID != inputSessionID {
+			event.Details["new_session_id"] = resultSessionID
+		}
+	}
+	if len(event.Details) == 0 {
+		event.Details = nil
+	}
+
+	return event
+}
+
+func sessionIDFromResult(result interface{}) string {
+	if result == nil {
+		return ""
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	sessionID, _ := raw["session_id"].(string)
+	return sessionID
+}
+
+func numberAsInt(value interface{}) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	default:
+		return 0, false
 	}
 }
 
