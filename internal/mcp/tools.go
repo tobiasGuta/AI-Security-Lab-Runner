@@ -237,6 +237,32 @@ func GetDefinedTools() []Tool {
 			},
 		},
 		{
+			Name:        "sandbox_get_logs",
+			Description: "Retrieve the redacted hunter-facing execution transcript for a sandbox session. Use after_event_id as a cursor for incremental reads. Command stdout/stderr is returned only when include_output is true and logging.include_command_output was enabled when the MCP server recorded the event.",
+			InputSchema: ToolSchema{
+				Type: "object",
+				Properties: map[string]SchemaProperty{
+					"session_id": {
+						Type:        "string",
+						Description: "Sandbox session ID whose execution transcript should be read.",
+					},
+					"after_event_id": {
+						Type:        "string",
+						Description: "Optional transcript cursor. Returns events after this event ID.",
+					},
+					"limit": {
+						Type:        "integer",
+						Description: "Maximum number of events to return (default 50, maximum 200).",
+					},
+					"include_output": {
+						Type:        "boolean",
+						Description: "Include stored stdout/stderr. Defaults to false to reduce sensitive output exposure and MCP token usage.",
+					},
+				},
+				Required: []string{"session_id"},
+			},
+		},
+		{
 			Name:        "sandbox_get_audit_summary",
 			Description: "Retrieve redacted audit log events for a sandbox session.",
 			InputSchema: ToolSchema{
