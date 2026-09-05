@@ -30,14 +30,30 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
-      # Several unit/integration packages exercise real runner containers and
-      # validate the image version. Build the local image before those tests so
-      # a fresh GitHub-hosted runner has the dependency they require.
+      # Several packages exercise real runner containers and validate the image
+      # version, so a fresh CI worker must build it before tests begin.
       - name: Build Runner Container Image
         run: docker build -t ai-security-agent-runner:latest -f runner/Dockerfile runner/
 
-      - name: Go Unit Tests
-        run: go test -v ./...
+      - name: Go Tests - Core
+        run: |
+          go test -v \
+            ./internal/audit \
+            ./internal/config \
+            ./internal/docker \
+            ./internal/output \
+            ./internal/pathsafe \
+            ./internal/scratchfs \
+            ./internal/security \
+            ./internal/session \
+            ./internal/transcript \
+            ./internal/validation
+
+      - name: Go Tests - Lab
+        run: go test -v ./internal/lab
+
+      - name: Go Tests - MCP
+        run: go test -v ./internal/mcp
 
       - name: Go Race Detector Tests
         run: go test -v -race ./...
