@@ -3,6 +3,7 @@ package lab_test
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,12 +15,41 @@ import (
 	"github.com/tobiasGuta/AI-Security-Lab-Runner/internal/lab"
 )
 
+// newHostGatewayTestServer starts a host-side test server that is reachable
+// through Docker's host-gateway mapping on native Linux as well as Docker
+// Desktop. The returned URL deliberately uses localhost so Lab Runner must
+// still exercise its localhost -> host.docker.internal translation path.
+func newHostGatewayTestServer(t *testing.T, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("failed to create host-gateway test listener: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(handler)
+	if err := server.Listener.Close(); err != nil {
+		_ = listener.Close()
+		t.Fatalf("failed to replace httptest listener: %v", err)
+	}
+	server.Listener = listener
+	server.Start()
+
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatalf("failed to determine host-gateway test port: %v", err)
+	}
+
+	return server, "http://localhost:" + port
+}
+
 func TestAgentFriendlyWorkflowIntegration(t *testing.T) {
 	cliClient := docker.NewCLIClient()
 	skipIfDockerUnavailable(t, cliClient)
 
 	// Create test HTTP server simulating challenge web service
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, hostGatewayURL := newHostGatewayTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/step1":
 			key := r.URL.Query().Get("key")
@@ -93,7 +123,7 @@ func TestAgentFriendlyWorkflowIntegration(t *testing.T) {
 	}
 
 	// Step 3: Perform structured HTTP request with calculated base64url value, saving cookies to /scratch/cookies.txt
-	req1URL := server.URL + "/step1?key=" + computedKey
+	req1URL := hostGatewayURL + "/step1?key=" + computedKey
 	httpRes1, err := eng.HTTPRequest(ctx, lab.HTTPRequestOptions{
 		SessionID:       sessID,
 		Method:          "GET",
@@ -110,7 +140,7 @@ func TestAgentFriendlyWorkflowIntegration(t *testing.T) {
 	}
 
 	// Step 4: Perform second request loading saved cookies from /scratch/cookies.txt with same session_id
-	req2URL := server.URL + "/step2"
+	req2URL := hostGatewayURL + "/step2"
 	httpRes2, err := eng.HTTPRequest(ctx, lab.HTTPRequestOptions{
 		SessionID:       sessID,
 		Method:          "GET",
