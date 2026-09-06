@@ -59,6 +59,11 @@ type Store struct {
 	options Options
 }
 
+// structuredSecretPattern covers serialized response data such as
+// {"access_token":"..."}. Keep the field name so transcripts remain useful
+// for authentication/OAuth analysis while removing the credential value.
+var structuredSecretPattern = regexp.MustCompile(`(?i)(["']?(access_token|refresh_token|id_token|auth_token|api[_-]?key|secret|password|token)["']?\s*:\s*)(["'][^"'\r\n]*["']|[^,\s}\]\r\n]+)`)
+
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(authorization:\s*)(bearer|basic)\s+[a-zA-Z0-9._~+/-]+=*`),
 	regexp.MustCompile(`(?i)(proxy-authorization:\s*)(bearer|basic)\s+[a-zA-Z0-9._~+/-]+=*`),
@@ -67,7 +72,8 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key|secret|password|token|auth_token)\s*[:=]\s*["']?[a-zA-Z0-9._~+/-]+["']?`),
 	regexp.MustCompile(`(?i)([?&](password|token|secret|api_key|key)=)[^&\s]+`),
 	regexp.MustCompile(`(?i)(https?://)[^:]+:[^@]+@`),
-	regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`),
+	// Match complete private-key blocks and blocks truncated before their END marker.
+	regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)`),
 	regexp.MustCompile(`(?i)(AKIA[0-9A-Z]{16})`),
 }
 
@@ -214,15 +220,21 @@ func (s *Store) sanitizeEvent(event *Event) {
 		event.Stdout = ""
 		event.Stderr = ""
 	} else {
-		var clipped bool
-		event.Stdout, clipped = clip(event.Stdout, s.options.MaxOutputBytes)
-		event.TranscriptTruncated = event.TranscriptTruncated || clipped
-		event.Stderr, clipped = clip(event.Stderr, s.options.MaxOutputBytes)
-		event.TranscriptTruncated = event.TranscriptTruncated || clipped
+		stdoutExceededLimit := s.options.MaxOutputBytes > 0 && int64(len(event.Stdout)) > s.options.MaxOutputBytes
+		stderrExceededLimit := s.options.MaxOutputBytes > 0 && int64(len(event.Stderr)) > s.options.MaxOutputBytes
+
+		// Redact before clipping. This lets secret detectors inspect complete output
+		// and also protects key blocks that the engine may already have truncated.
 		if s.options.RedactSecrets {
 			event.Stdout = redact(event.Stdout)
 			event.Stderr = redact(event.Stderr)
 		}
+
+		var clipped bool
+		event.Stdout, clipped = clip(event.Stdout, s.options.MaxOutputBytes)
+		event.TranscriptTruncated = event.TranscriptTruncated || stdoutExceededLimit || clipped
+		event.Stderr, clipped = clip(event.Stderr, s.options.MaxOutputBytes)
+		event.TranscriptTruncated = event.TranscriptTruncated || stderrExceededLimit || clipped
 	}
 
 	if event.Details != nil && s.options.RedactSecrets {
@@ -247,7 +259,7 @@ func clip(value string, maxBytes int64) (string, bool) {
 }
 
 func redact(input string) string {
-	result := input
+	result := structuredSecretPattern.ReplaceAllString(input, `${1}"[REDACTED_SECRET]"`)
 	for _, pattern := range secretPatterns {
 		result = pattern.ReplaceAllString(result, "[REDACTED_SECRET]")
 	}
