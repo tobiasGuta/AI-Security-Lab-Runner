@@ -2,6 +2,7 @@ package lab
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,6 +24,35 @@ func skipIfDockerUnavailable(t *testing.T, cliClient *docker.CLIClient) {
 	if err := cliClient.CheckLinuxContainers(ctx); err != nil {
 		t.Skipf("Linux containers check failed: %v", err)
 	}
+}
+
+// newHostGatewayTestServer starts a host-side test server that is reachable
+// through Docker's host-gateway mapping on native Linux as well as Docker
+// Desktop. The returned URL deliberately uses localhost so Lab Runner must
+// still exercise its localhost -> host.docker.internal translation path.
+func newHostGatewayTestServer(t *testing.T, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("failed to create host-gateway test listener: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(handler)
+	if err := server.Listener.Close(); err != nil {
+		_ = listener.Close()
+		t.Fatalf("failed to replace httptest listener: %v", err)
+	}
+	server.Listener = listener
+	server.Start()
+
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatalf("failed to determine host-gateway test port: %v", err)
+	}
+
+	return server, "http://localhost:" + port
 }
 
 func TestDockerIntegrationFullSuite(t *testing.T) {
@@ -73,7 +103,7 @@ func TestDockerIntegrationFullSuite(t *testing.T) {
 	}
 
 	// 3. Localhost Translation with Local Test Server
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts, hostGatewayURL := newHostGatewayTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("local server response"))
 	}))
@@ -82,7 +112,7 @@ func TestDockerIntegrationFullSuite(t *testing.T) {
 	localHTTPRes, err := eng.HTTPRequest(ctx, HTTPRequestOptions{
 		SessionID: sessID,
 		Method:    "GET",
-		URL:       ts.URL,
+		URL:       hostGatewayURL,
 	})
 	if err != nil || localHTTPRes.StatusCode != 200 || !strings.Contains(localHTTPRes.Body, "local server response") {
 		t.Errorf("Localhost translation HTTP request failed: err=%v, res=%+v", err, localHTTPRes)
