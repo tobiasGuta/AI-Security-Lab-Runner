@@ -143,3 +143,32 @@ func TestTTLAlreadyRunningLeaseCanFinishWithoutNewAdmission(t *testing.T) {
 		t.Fatalf("active count after release: session=%+v err=%v", s, err)
 	}
 }
+
+func TestTTLRestartRecoversInterruptedLeaseForCleanup(t *testing.T) {
+	mgr, id := newTTLTestManager(t)
+	if err := mgr.UpdateSessionState(id, func(s *Session) {
+		s.ActiveExecCount = 1
+		s.ExpiresAt = time.Now().Add(-time.Second)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewManager(mgr.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := recovered.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ActiveExecCount != 0 || s.Status != StateFailed || !s.CleanupRetryable {
+		t.Fatalf("crashed execution should become a failed, reclaimable session: %+v", s)
+	}
+	if _, err := recovered.AcquireExecLease(context.Background(), id); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("recovered expired session must reject execution: %v", err)
+	}
+	candidates := recovered.ListStaleSessions(time.Now().UTC())
+	if len(candidates) != 1 || candidates[0].ID != id {
+		t.Fatalf("recovered session not eligible for cleanup: %+v", candidates)
+	}
+}
