@@ -972,6 +972,37 @@ func (e *Engine) CleanupStaleSessions(ctx context.Context, dryRun bool) []StaleC
 	return results
 }
 
+// RunStaleSessionReaper reclaims expired/failed persisted sessions while an
+// MCP controller is running. The first sweep runs immediately on startup;
+// subsequent sweeps use a bounded interval. There is no detached worker after
+// the provided context is cancelled.
+func (e *Engine) RunStaleSessionReaper(ctx context.Context, interval time.Duration, report func(StaleCleanupResult)) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	sweep := func() {
+		if ctx.Err() != nil {
+			return
+		}
+		for _, result := range e.CleanupStaleSessions(ctx, false) {
+			if report != nil {
+				report(result)
+			}
+		}
+	}
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
 type StopResult struct {
 	SessionID      string                 `json:"session_id"`
 	Operation      string                 `json:"operation"`

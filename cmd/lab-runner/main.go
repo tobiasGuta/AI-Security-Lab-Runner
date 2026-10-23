@@ -591,6 +591,14 @@ func cmdServe(args []string) {
 		cancel()
 	}()
 
+	// Reap stale sessions while Codex/MCP keeps the controller alive.
+	// Progress/errors must go to stderr; stdout is reserved for MCP JSON-RPC.
+	go engine.RunStaleSessionReaper(ctx, 30*time.Second, func(result lab.StaleCleanupResult) {
+		if result.Error != "" {
+			fmt.Fprintf(os.Stderr, "[lab-runner] stale cleanup failed for %s: %s\n", result.SessionID, result.Error)
+		}
+	})
+
 	server := mcp.NewServer(engine, os.Stdin, os.Stdout)
 	if err := server.Serve(ctx); err != nil && err != context.Canceled {
 		fmt.Fprintf(os.Stderr, "MCP server exited with error: %v\n", err)
