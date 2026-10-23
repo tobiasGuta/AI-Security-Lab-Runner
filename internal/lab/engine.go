@@ -159,7 +159,7 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 	}
 
 	start := time.Now()
-	exitCode, stdout, stderr, timedOut, truncated, err := e.dockerClient.ExecInRunner(
+	exitCode, stdout, stderr, timedOut, stdoutTruncated, stderrTruncated, err := e.dockerClient.ExecInRunner(
 		ctx,
 		sess.ComposeProject,
 		sess.ComposeFilePath,
@@ -175,8 +175,8 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 	res.Stdout = stdout
 	res.Stderr = stderr
 	res.TimedOut = timedOut
-	res.StdoutTruncated = truncated
-	res.StderrTruncated = truncated
+	res.StdoutTruncated = stdoutTruncated
+	res.StderrTruncated = stderrTruncated
 
 	if e.auditLogger != nil {
 		_ = e.auditLogger.Log(audit.Event{
@@ -187,7 +187,7 @@ func (e *Engine) Run(ctx context.Context, command, cwd string, timeoutSec int, e
 			DurationMS:      res.DurationMS,
 			ExitCode:        &exitCode,
 			TimedOut:        timedOut,
-			OutputTruncated: truncated,
+			OutputTruncated: stdoutTruncated || stderrTruncated,
 			RedactedCommand: command,
 		})
 	}
@@ -327,7 +327,7 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 	timeout := time.Duration(timeoutSec) * time.Second
 
 	start := time.Now()
-	exitCode, stdout, stderr, timedOut, truncated, err := e.dockerClient.ExecInRunner(
+	exitCode, stdout, stderr, timedOut, stdoutTruncated, stderrTruncated, err := e.dockerClient.ExecInRunner(
 		ctx,
 		sess.ComposeProject,
 		sess.ComposeFilePath,
@@ -348,7 +348,7 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 			DurationMS:      duration,
 			ExitCode:        &exitCode,
 			TimedOut:        timedOut,
-			OutputTruncated: truncated,
+			OutputTruncated: stdoutTruncated || stderrTruncated,
 			RedactedCommand: command,
 		})
 	}
@@ -368,8 +368,8 @@ func (e *Engine) Exec(ctx context.Context, sessID, command, cwd string, timeoutS
 		DurationMS:      duration,
 		Stdout:          stdout,
 		Stderr:          stderr,
-		StdoutTruncated: truncated,
-		StderrTruncated: truncated,
+		StdoutTruncated: stdoutTruncated,
+		StderrTruncated: stderrTruncated,
 	}, nil
 }
 
@@ -400,10 +400,10 @@ func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []str
 	start := time.Now()
 	var exitCode int
 	var stdout, stderr string
-	var timedOut, truncated bool
+	var timedOut, stdoutTruncated, stderrTruncated bool
 
 	if sess != nil {
-		exitCode, stdout, stderr, timedOut, truncated, err = e.dockerClient.ExecArgvWithInputInRunner(
+		exitCode, stdout, stderr, timedOut, stdoutTruncated, stderrTruncated, err = e.dockerClient.ExecArgvWithInputInRunner(
 			ctx,
 			sess.ComposeProject,
 			sess.ComposeFilePath,
@@ -448,7 +448,7 @@ func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []str
 			s.Status = session.StateReady
 		})
 
-		exitCode, stdout, stderr, timedOut, truncated, err = e.dockerClient.ExecArgvWithInputInRunner(
+		exitCode, stdout, stderr, timedOut, stdoutTruncated, stderrTruncated, err = e.dockerClient.ExecArgvWithInputInRunner(
 			ctx,
 			ephSess.ComposeProject,
 			ephSess.ComposeFilePath,
@@ -474,8 +474,8 @@ func (e *Engine) execInternalArgv(ctx context.Context, sessID string, argv []str
 		DurationMS:      duration,
 		Stdout:          stdout,
 		Stderr:          stderr,
-		StdoutTruncated: truncated,
-		StderrTruncated: truncated,
+		StdoutTruncated: stdoutTruncated,
+		StderrTruncated: stderrTruncated,
 	}, nil
 }
 
