@@ -122,4 +122,16 @@ func TestDockerStdoutCaptureComprehensive(t *testing.T) {
 	if err != nil || exitCode != 0 || !bytes.Equal(binBuf.Bytes(), expectedBytes) {
 		t.Errorf("Binary stdout path failed: exit=%d, bytes=%v, expected=%v, err=%v", exitCode, binBuf.Bytes(), expectedBytes, err)
 	}
+
+	// 11. Large stderr must be drained but bounded independently of stdout.
+	exitCode, stdout, stderr, _, outCut, errCut, err := cliClient.ExecInRunner(ctx, projectName, composePath, "/scratch", `python3 -c "import sys; sys.stderr.write('E' * 300)"`, nil, 10*time.Second, 100)
+	if err != nil || exitCode != 0 || stdout != "" || len(stderr) != 100 || outCut || !errCut {
+		t.Errorf("stderr bound failed: exit=%d stdout=%q stderrLen=%d outCut=%v errCut=%v err=%v", exitCode, stdout, len(stderr), outCut, errCut, err)
+	}
+
+	// 12. Large stdout must not mark stderr as truncated.
+	exitCode, stdout, stderr, _, outCut, errCut, err = cliClient.ExecInRunner(ctx, projectName, composePath, "/scratch", `python3 -c "import sys; sys.stdout.write('O' * 300)"`, nil, 10*time.Second, 100)
+	if err != nil || exitCode != 0 || len(stdout) != 100 || stderr != "" || !outCut || errCut {
+		t.Errorf("stdout bound failed: exit=%d stdoutLen=%d stderr=%q outCut=%v errCut=%v err=%v", exitCode, len(stdout), stderr, outCut, errCut, err)
+	}
 }
