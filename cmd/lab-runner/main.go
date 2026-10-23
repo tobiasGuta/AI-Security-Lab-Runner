@@ -723,33 +723,57 @@ func cmdDoctor(args []string) {
 
 func cmdCleanup(args []string) {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
-	dryRun := fs.Bool("dry-run", false, "Show resources to clean without deleting")
-	_ = fs.Bool("stale", false, "Clean stale sessions")
+	dryRun := fs.Bool("dry-run", false, "List stale sessions without removing anything")
+	_ = fs.Bool("stale", false, "Clean only stale sessions (default behavior)")
 	configPath := fs.String("config", "", "Path to config file")
 	_ = fs.Parse(args)
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "cleanup does not accept positional arguments")
+		os.Exit(2)
+	}
 
-	_, _, err := loadEngine(*configPath)
+	_, engine, err := loadEngine(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Cleanup initialization error: %v\n", err)
 		os.Exit(1)
 	}
 
-	dockerClient := docker.NewCLIClient()
-	ctx := context.Background()
-	resources, err := dockerClient.ListManagedResources(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cleanup check error: %v\n", err)
+	results := engine.CleanupStaleSessions(context.Background(), *dryRun)
+	if printCleanupReport(results, *dryRun, os.Stdout, os.Stderr) != 0 {
 		os.Exit(1)
 	}
+}
 
-	if *dryRun {
-		fmt.Printf("Cleanup Dry Run: %d managed resources identified:\n", len(resources))
-		for _, r := range resources {
-			fmt.Printf("  - %s\n", r)
+// printCleanupReport only reports success after StopSession verified that
+// the runner, network, scratch volume, and state are absent.
+func printCleanupReport(results []lab.StaleCleanupResult, dryRun bool, stdout, stderr io.Writer) int {
+	if dryRun {
+		fmt.Fprintf(stdout, "Cleanup Dry Run: %d stale session candidate(s); no resources removed.\n", len(results))
+		for _, result := range results {
+			fmt.Fprintf(stdout, "  - %s (status: %s)\n", result.SessionID, result.PriorStatus)
 		}
-	} else {
-		fmt.Printf("Cleaned up %d stale managed resources.\n", len(resources))
+		return 0
 	}
+
+	cleaned, failed := 0, 0
+	for _, result := range results {
+		if result.Error != "" || !result.Cleaned {
+			failed++
+			reason := result.Error
+			if reason == "" {
+				reason = "resource absence was not verified"
+			}
+			fmt.Fprintf(stderr, "FAILED cleanup %s: %s\n", result.SessionID, reason)
+			continue
+		}
+		cleaned++
+		fmt.Fprintf(stdout, "Cleaned session %s (runner, network, scratch volume and state verified absent).\n", result.SessionID)
+	}
+	fmt.Fprintf(stdout, "Cleanup complete: %d verified cleaned, %d failed, %d stale candidate(s).\n", cleaned, failed, len(results))
+	if failed > 0 {
+		return 1
+	}
+	return 0
 }
 
 func cmdVersion(args []string) {
