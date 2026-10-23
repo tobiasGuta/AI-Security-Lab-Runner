@@ -40,17 +40,17 @@ func (m *MockDockerClient) InspectResources(ctx context.Context, projectName, se
 		ScratchVolume: docker.ResourceState{Present: true, Identity: "mock_v_12345", OwnershipVerified: true},
 	}, nil
 }
-func (m *MockDockerClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, nil
+func (m *MockDockerClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error) {
+	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, false, nil
 }
-func (m *MockDockerClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, nil
+func (m *MockDockerClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error) {
+	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, false, nil
 }
-func (m *MockDockerClient) ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
+func (m *MockDockerClient) ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error) {
 	if len(argv) > 1 && argv[1] == "stat" {
-		return 0, `{"path":"/scratch/test.txt","size":100,"is_regular":true}`, "", false, false, nil
+		return 0, `{"path":"/scratch/test.txt","size":100,"is_regular":true}`, "", false, false, false, nil
 	}
-	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, nil
+	return 0, `{"requested_url":"http://localhost:3000/api/info","effective_url":"http://localhost:3000/api/info","status_code":200,"headers":{"Content-Type":["application/json"]},"body":"{\"status\":\"ok\"}","duration_ms":100,"curl_exit_code":0,"host_gateway_translation":true,"connection_host":"host.docker.internal"}`, "", false, false, false, nil
 }
 func (m *MockDockerClient) ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, writer io.Writer, maxOutputBytes int64) (exitCode int, stderr string, timedOut, truncated bool, err error) {
 	_, _ = writer.Write([]byte("mock export data binary stream"))
