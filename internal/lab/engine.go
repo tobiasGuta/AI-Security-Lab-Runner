@@ -932,6 +932,46 @@ func (e *Engine) ExportFile(ctx context.Context, sessID, scratchPath, destName s
 	}, nil
 }
 
+// StaleCleanupResult distinguishes candidate discovery, verified deletion,
+// and a failed cleanup. A failed result must never be described as cleaned.
+type StaleCleanupResult struct {
+	SessionID   string                 `json:"session_id"`
+	PriorStatus session.State          `json:"prior_status"`
+	DryRun      bool                   `json:"dry_run"`
+	Cleaned     bool                   `json:"cleaned"`
+	Cleanup     session.CleanupSummary `json:"cleanup"`
+	Error       string                 `json:"error,omitempty"`
+}
+
+// CleanupStaleSessions uses the same ownership-checked cleanup as sandbox stop.
+// It only acts on persisted sessions that are expired or in failure states,
+// and never targets unrelated or merely label-matched Docker resources.
+func (e *Engine) CleanupStaleSessions(ctx context.Context, dryRun bool) []StaleCleanupResult {
+	candidates := e.sessMgr.ListStaleSessions(time.Now().UTC())
+	results := make([]StaleCleanupResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		result := StaleCleanupResult{
+			SessionID:   candidate.ID,
+			PriorStatus: candidate.Status,
+			DryRun:      dryRun,
+		}
+		if !dryRun {
+			stopped, err := e.StopSession(ctx, candidate.ID)
+			if err != nil {
+				result.Error = err.Error()
+			} else {
+				result.Cleanup = stopped.Cleanup
+				result.Cleaned = stopped.Cleanup.RunnerRemoved &&
+					stopped.Cleanup.NetworkRemoved &&
+					stopped.Cleanup.ScratchRemoved &&
+					stopped.Cleanup.StateRemoved
+			}
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
 type StopResult struct {
 	SessionID      string                 `json:"session_id"`
 	Operation      string                 `json:"operation"`
