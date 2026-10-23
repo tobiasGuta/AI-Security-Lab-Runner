@@ -68,3 +68,25 @@ unexpired sessions, or delete orphaned resources that have no persisted
 session record. Review those separately instead of deleting by label alone.
 Do not run separate controller instances against the same state directory
 concurrently.
+
+## Session TTL Enforcement
+
+The session expiration timestamp is an execution-admission deadline, not just
+informational metadata. Once a session's TTL expires, new `sandbox exec`,
+structured HTTP, and scratch file operations are rejected, even if an
+execution call was queued before expiry. Commands already admitted before
+expiry are allowed to finish; cleanup waits until those execution leases
+are released.
+
+During `lab-runner serve` (the stdio MCP server used by AI assistants),
+the controller sweeps persisted stale sessions at startup and every 30 seconds.
+It uses the same ownership-verified cleanup as `lab-runner cleanup`, and logs
+cleanup failures to stderr, never to the MCP protocol stdout. Failed cleanups
+remain eligible for later retries. An interrupted execution lease found on
+restart is treated as a failed session requiring cleanup, not resumed.
+
+The TTL reaper only operates while the MCP server process is running. There
+is no always-on daemon for one-shot CLI calls; use `lab-runner cleanup` to
+remove expired sessions when the MCP server isn't running. No automatic
+cleanup applies to Docker resources with no persisted session record.
+Only one controller instance may own a given state directory at a time.
