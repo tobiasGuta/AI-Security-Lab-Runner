@@ -46,10 +46,10 @@ type Client interface {
 	ComposeUp(ctx context.Context, projectName, composeFilePath string) (ResourceSnapshot, error)
 	ComposeDown(ctx context.Context, projectName, composeFilePath string) error
 	InspectResources(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) (ResourceInspection, error)
-	ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
-	ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
-	ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error)
-	ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, writer io.Writer, maxOutputBytes int64) (exitCode int, stderr string, timedOut, truncated bool, err error)
+	ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, cmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error)
+	ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error)
+	ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error)
+	ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, writer io.Writer, maxOutputBytes int64) (exitCode int, stderr string, timedOut, stderrTruncated bool, err error)
 	CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error
 	ListManagedResources(ctx context.Context) ([]string, error)
 	VerifyResourceOwnership(ctx context.Context, projectName, sessionID string, snapshot ResourceSnapshot) error
@@ -313,7 +313,7 @@ func (c *CLIClient) ComposeDown(ctx context.Context, projectName, composeFilePat
 	return nil
 }
 
-func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, agentCmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
+func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePath, cwd, agentCmd string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error) {
 	timeoutSec := int(timeout.Seconds())
 	if timeoutSec <= 0 {
 		timeoutSec = 30
@@ -327,31 +327,28 @@ func (c *CLIClient) ExecInRunner(ctx context.Context, projectName, composeFilePa
 	return c.ExecArgvWithInputInRunner(ctx, projectName, composeFilePath, cwd, argv, nil, env, timeout, maxOutputBytes)
 }
 
-func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
+func (c *CLIClient) ExecArgvInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error) {
 	return c.ExecArgvWithInputInRunner(ctx, projectName, composeFilePath, cwd, argv, nil, env, timeout, maxOutputBytes)
 }
 
-func (c *CLIClient) ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, truncated bool, err error) {
-	var stdoutBuf bytes.Buffer
-	var writer io.Writer = &stdoutBuf
-	var bounded *output.BoundedWriter
-	if maxOutputBytes > 0 {
-		bounded = output.NewBoundedWriter(maxOutputBytes)
-		writer = bounded
-	}
+// Docker exec has separate stdout and stderr bounds. A non-positive limit
+// uses the controller's 1 MiB safe default rather than unlimited buffering.
+const defaultExecOutputLimit int64 = 1024 * 1024
 
-	var stderrRes string
-	exitCode, stderrRes, timedOut, _, err = c.ExecArgvWithBinaryStdoutInRunner(ctx, projectName, composeFilePath, cwd, argv, stdin, env, timeout, writer, maxOutputBytes)
-	if bounded != nil {
-		stdout = bounded.String()
-		truncated = bounded.Truncated
-	} else {
-		stdout = stdoutBuf.String()
+func execOutputLimit(maxOutputBytes int64) int64 {
+	if maxOutputBytes <= 0 {
+		return defaultExecOutputLimit
 	}
-	return exitCode, stdout, stderrRes, timedOut, truncated, err
+	return maxOutputBytes
 }
 
-func (c *CLIClient) ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, writer io.Writer, maxOutputBytes int64) (exitCode int, stderr string, timedOut, truncated bool, err error) {
+func (c *CLIClient) ExecArgvWithInputInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, maxOutputBytes int64) (exitCode int, stdout, stderr string, timedOut, stdoutTruncated, stderrTruncated bool, err error) {
+	stdoutBuf := output.NewBoundedWriter(execOutputLimit(maxOutputBytes))
+	exitCode, stderr, timedOut, stderrTruncated, err = c.ExecArgvWithBinaryStdoutInRunner(ctx, projectName, composeFilePath, cwd, argv, stdin, env, timeout, stdoutBuf, maxOutputBytes)
+	return exitCode, stdoutBuf.String(), stderr, timedOut, stdoutBuf.Truncated, stderrTruncated, err
+}
+
+func (c *CLIClient) ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projectName, composeFilePath, cwd string, argv []string, stdin []byte, env map[string]string, timeout time.Duration, writer io.Writer, maxOutputBytes int64) (exitCode int, stderr string, timedOut, stderrTruncated bool, err error) {
 	hostTimeout := timeout + 5*time.Second
 	if timeout <= 0 {
 		hostTimeout = 35 * time.Second
@@ -385,10 +382,14 @@ func (c *CLIClient) ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projec
 	}
 
 	cmd.Stdout = writer
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	// Always drain stderr, discarding bytes beyond the cap while preserving
+	// the exact prefix and reporting independent stderr truncation.
+	stderrBuf := output.NewBoundedWriter(execOutputLimit(maxOutputBytes))
+	cmd.Stderr = stderrBuf
 
 	execErr := cmd.Run()
+	stderr = stderrBuf.String()
+	stderrTruncated = stderrBuf.Truncated
 
 	exitCode = 0
 	if execErr != nil {
@@ -402,11 +403,11 @@ func (c *CLIClient) ExecArgvWithBinaryStdoutInRunner(ctx context.Context, projec
 			timedOut = true
 			exitCode = 124
 		} else {
-			return -1, stderrBuf.String(), false, false, fmt.Errorf("%w: docker execution system error: %v (stderr: %s)", ErrDockerExecFailed, execErr, stderrBuf.String())
+			return -1, stderr, false, stderrTruncated, fmt.Errorf("%w: docker execution system error: %v (stderr: %s)", ErrDockerExecFailed, execErr, stderr)
 		}
 	}
 
-	return exitCode, stderrBuf.String(), timedOut, false, nil
+	return exitCode, stderr, timedOut, stderrTruncated, nil
 }
 
 func (c *CLIClient) CopyFileFromRunner(ctx context.Context, projectName, scratchContainerPath, hostDestPath string) error {
