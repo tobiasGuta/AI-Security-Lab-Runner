@@ -31,15 +31,15 @@ func runFakeDockerExec(t *testing.T, c *CLIClient, maxOutput int64) (int, string
 
 func TestDockerExecIndependentOutputLimits(t *testing.T) {
 	tests := []struct {
-		name        string
-		stdout      string
-		stderr      string
-		limit       int64
-		exitCode    int
-		wantOut     string
-		wantErr     string
-		wantOutCut  bool
-		wantErrCut  bool
+		name       string
+		stdout     string
+		stderr     string
+		limit      int64
+		exitCode   int
+		wantOut    string
+		wantErr    string
+		wantOutCut bool
+		wantErrCut bool
 	}{
 		{"stderr only", "", strings.Repeat("E", 128), 16, 0, "", strings.Repeat("E", 16), false, true},
 		{"stdout only", strings.Repeat("O", 128), "", 16, 0, strings.Repeat("O", 16), "", true, false},
