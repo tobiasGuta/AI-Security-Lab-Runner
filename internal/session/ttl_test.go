@@ -144,7 +144,7 @@ func TestTTLAlreadyRunningLeaseCanFinishWithoutNewAdmission(t *testing.T) {
 	}
 }
 
-func TestTTLRestartRecoversInterruptedLeaseForCleanup(t *testing.T) {
+func TestTTLRestartPreservesUnknownActiveLeaseWithoutOwnershipProof(t *testing.T) {
 	mgr, id := newTTLTestManager(t)
 	if err := mgr.UpdateSessionState(id, func(s *Session) {
 		s.ActiveExecCount = 1
@@ -152,23 +152,24 @@ func TestTTLRestartRecoversInterruptedLeaseForCleanup(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	recovered, err := NewManager(mgr.cfg)
+	// Another controller might still own the lease; a state reload cannot
+	// infer that the original owner is dead without a process ownership lock.
+	reloaded, err := NewManager(mgr.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := recovered.GetSession(id)
+	s, err := reloaded.GetSession(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.ActiveExecCount != 0 || s.Status != StateFailed || !s.CleanupRetryable {
-		t.Fatalf("crashed execution should become a failed, reclaimable session: %+v", s)
+	if s.ActiveExecCount != 1 {
+		t.Fatalf("reload cleared unverified active lease: %+v", s)
 	}
-	if _, err := recovered.AcquireExecLease(context.Background(), id); !errors.Is(err, ErrSessionExpired) {
-		t.Fatalf("recovered expired session must reject execution: %v", err)
+	_, err = reloaded.AcquireExecLease(context.Background(), id)
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("expired session admitted work after reload: %v", err)
 	}
-	candidates := recovered.ListStaleSessions(time.Now().UTC())
-	if len(candidates) != 1 || candidates[0].ID != id {
-		t.Fatalf("recovered session not eligible for cleanup: %+v", candidates)
+	if candidates := reloaded.ListStaleSessions(time.Now()); len(candidates) != 0 {
+		t.Fatalf("unverified active lease selected for deletion: %+v", candidates)
 	}
 }
