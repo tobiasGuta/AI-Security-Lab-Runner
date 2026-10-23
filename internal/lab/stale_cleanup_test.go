@@ -73,8 +73,8 @@ func TestCleanupStaleSessionsDryRunAndVerifiedRemoval(t *testing.T) {
 	if client.downs != 0 {
 		t.Fatal("dry-run invoked Docker cleanup")
 	}
-	if state := engine.sessMgr.sessions[stale].Status; state != session.StateReady {
-		t.Fatalf("dry-run unexpectedly mutated status to %s", state)
+	if candidates := engine.sessMgr.ListStaleSessions(time.Now().UTC()); len(candidates) != 1 || candidates[0].Status != session.StateReady {
+		t.Fatalf("dry-run unexpectedly changed candidate state: %+v", candidates)
 	}
 
 	cleaned := engine.CleanupStaleSessions(context.Background(), false)
