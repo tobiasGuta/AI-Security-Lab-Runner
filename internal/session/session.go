@@ -508,6 +508,22 @@ func (m *Manager) loadSavedSessions() error {
 		if err := json.Unmarshal(data, &sess); err == nil && sess.ID != "" {
 			cleanID, err := pathsafe.CleanHostPath(sess.ID)
 			if err == nil && cleanID == sess.ID {
+				// Execution leases are process-local and cannot survive a
+				// controller restart. Never resume an interrupted session
+				// as if its previous commands were known to have finished.
+				// This requires a single controller owner per state dir.
+				if sess.ActiveExecCount != 0 {
+					sess.ActiveExecCount = 0
+					switch sess.Status {
+					case StateCreated, StateStarting, StateReady, StateRunningCommand:
+						sess.Status = StateFailed
+						sess.CleanupError = "interrupted execution lease recovered at startup"
+						sess.CleanupRetryable = true
+					}
+					if err := m.saveSessionLocked(&sess); err != nil {
+						return fmt.Errorf("failed to persist interrupted session %s: %w", sess.ID, err)
+					}
+				}
 				m.sessions[sess.ID] = &sess
 				m.sessionSems[sess.ID] = make(chan struct{}, sessLimit)
 			}
