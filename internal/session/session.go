@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -350,6 +351,32 @@ func (m *Manager) ListSessions() []Session {
 		list = append(list, *s)
 	}
 	return list
+}
+
+// ListStaleSessions snapshots candidates for explicit cleanup. It does not
+// mutate session state or remove Docker resources (including in dry-run mode).
+// Both persistent and interrupted ephemeral sessions can be reclaimed.
+func (m *Manager) ListStaleSessions(now time.Time) []Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var candidates []Session
+	for _, s := range m.sessions {
+		// Never select a session with an active execution lease.
+		if s.ActiveExecCount != 0 {
+			continue
+		}
+		expired := !s.ExpiresAt.IsZero() && !now.Before(s.ExpiresAt)
+		retryable := s.Status == StateExpired || s.Status == StateFailed || s.Status == StateCleanupFailed
+		if !expired && !retryable {
+			continue
+		}
+		candidates = append(candidates, *s)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].ID < candidates[j].ID
+	})
+	return candidates
 }
 
 func (m *Manager) Transition(id string, from, to State) error {
