@@ -82,8 +82,10 @@ During `lab-runner serve` (the stdio MCP server used by AI assistants),
 the controller sweeps persisted stale sessions at startup and every 30 seconds.
 It uses the same ownership-verified cleanup as `lab-runner cleanup`, and logs
 cleanup failures to stderr, never to the MCP protocol stdout. Failed cleanups
-remain eligible for later retries. An interrupted execution lease found on
-restart is treated as a failed session requiring cleanup, not resumed.
+remain eligible for later retries. Persisted active-lease counters are not
+cleared automatically on restart: without exclusive ownership proof, a second
+controller cannot assume an in-flight lease is abandoned. Such records may
+need an operator-controlled recovery procedure.
 
 The TTL reaper only operates while the MCP server process is running. There
 is no always-on daemon for one-shot CLI calls; use `lab-runner cleanup` to
