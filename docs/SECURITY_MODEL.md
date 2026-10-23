@@ -10,3 +10,4 @@
 6. **Non-Root Execution**: User `agent` (UID 10001).
 7. **Symlink Containment**: `sandbox-fs` helper enforces `/scratch` root boundary for reads, writes, stats, and hashes.
 8. **Redacted Audit Log**: Passwords, tokens, bearer headers, cookies, API keys redacted automatically.
+9. **Bounded Container Command Output**: Each Docker exec command's stdout and stderr is capped independently by `limits.maximum_output_bytes` (default 1 MiB each). Excess bytes are drained and discarded; responses distinguish `stdout_truncated` from `stderr_truncated`. A non-positive direct API limit uses the 1 MiB default rather than creating an unbounded stream buffer. Binary export stdout remains streamed to the export destination while its stderr is bounded.
