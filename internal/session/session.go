@@ -19,6 +19,7 @@ import (
 
 var (
 	ErrSessionNotFound        = errors.New("session not found")
+	ErrSessionExpired         = errors.New("session TTL expired")
 	ErrInvalidStateTransition = errors.New("invalid session state transition")
 	ErrSessionLimitReached    = errors.New("maximum active session limit reached")
 	ErrConcurrentExecLimit    = errors.New("concurrent command execution limit reached")
@@ -200,7 +201,23 @@ func (m *Manager) CreateSession(mode Mode, ttlMinutes int, outboundEnabled, host
 	return s, nil
 }
 
-// AcquireExecLease acquires execution lease and semaphores cleanly. Rejects if session is stopping or not ready.
+// expireSessionLocked records expiry while holding m.mu. Expiry is checked
+// against the clock, not only against a previously observed session status.
+func (m *Manager) expireSessionLocked(sess *Session, now time.Time) bool {
+	if sess.ExpiresAt.IsZero() || now.Before(sess.ExpiresAt) {
+		return false
+	}
+	switch sess.Status {
+	case StateCreated, StateStarting, StateReady, StateRunningCommand:
+		sess.Status = StateExpired
+		_ = m.saveSessionLocked(sess)
+	}
+	return true
+}
+
+// AcquireExecLease checks TTL both before reserving a slot and after
+// acquiring semaphores: a request queued before expiry may not execute
+// once the deadline has passed. Existing in-flight leases may finish.
 func (m *Manager) AcquireExecLease(ctx context.Context, id string) (func(), error) {
 	m.mu.Lock()
 	sess, ok := m.sessions[id]
@@ -208,7 +225,10 @@ func (m *Manager) AcquireExecLease(ctx context.Context, id string) (func(), erro
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
 	}
-
+	if m.expireSessionLocked(sess, time.Now().UTC()) {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: session '%s'", ErrSessionExpired, id)
+	}
 	if sess.Status != StateReady && sess.Status != StateRunningCommand {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: session '%s' is in state '%s'", ErrSessionStopping, id, sess.Status)
@@ -228,7 +248,7 @@ func (m *Manager) AcquireExecLease(ctx context.Context, id string) (func(), erro
 	_ = m.saveSessionLocked(sess)
 	m.mu.Unlock()
 
-	// Acquire global semaphore
+	// Reserve global and per-session slots, observing cancellation.
 	select {
 	case m.globalSem <- struct{}{}:
 	case <-ctx.Done():
@@ -236,13 +256,36 @@ func (m *Manager) AcquireExecLease(ctx context.Context, id string) (func(), erro
 		return nil, ctx.Err()
 	}
 
-	// Acquire session semaphore
 	select {
 	case sessSem <- struct{}{}:
 	case <-ctx.Done():
 		<-m.globalSem
 		m.decrementExecCount(id)
 		return nil, ctx.Err()
+	}
+
+	// The request may have waited for a slot until after TTL expiry, or a
+	// concurrent stop may have transitioned it out of the ready state.
+	m.mu.Lock()
+	current, exists := m.sessions[id]
+	var admissionErr error
+	switch {
+	case !exists:
+		admissionErr = fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
+	case m.expireSessionLocked(current, time.Now().UTC()):
+		admissionErr = fmt.Errorf("%w: session '%s'", ErrSessionExpired, id)
+	case current.Status != StateReady && current.Status != StateRunningCommand:
+		admissionErr = fmt.Errorf("%w: session '%s' is in state '%s'", ErrSessionStopping, id, current.Status)
+	}
+	if admissionErr != nil && exists {
+		current.ActiveExecCount--
+		_ = m.saveSessionLocked(current)
+	}
+	m.mu.Unlock()
+	if admissionErr != nil {
+		<-sessSem
+		<-m.globalSem
+		return nil, admissionErr
 	}
 
 	var once sync.Once
@@ -253,7 +296,6 @@ func (m *Manager) AcquireExecLease(ctx context.Context, id string) (func(), erro
 			m.decrementExecCount(id)
 		})
 	}
-
 	return release, nil
 }
 
@@ -312,10 +354,7 @@ func (m *Manager) GetSession(id string) (*Session, error) {
 		return nil, fmt.Errorf("%w: '%s'", ErrSessionNotFound, id)
 	}
 
-	if time.Now().UTC().After(s.ExpiresAt) && (s.Status == StateReady || s.Status == StateCreated) {
-		s.Status = StateExpired
-		_ = m.saveSessionLocked(s)
-	}
+	m.expireSessionLocked(s, time.Now().UTC())
 
 	cp := *s
 	return &cp, nil
@@ -344,10 +383,7 @@ func (m *Manager) ListSessions() []Session {
 		if s.Mode == ModeEphemeral {
 			continue // Ephemeral sessions are internal transient sessions
 		}
-		if now.After(s.ExpiresAt) && (s.Status == StateReady || s.Status == StateCreated) {
-			s.Status = StateExpired
-			_ = m.saveSessionLocked(s)
-		}
+		m.expireSessionLocked(s, now)
 		list = append(list, *s)
 	}
 	return list
